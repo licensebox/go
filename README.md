@@ -10,6 +10,9 @@ user in once, by email, then checks the licence with licensebox at every
 run. When licensebox can't be reached, the signed lease kept on the machine
 lets the app run offline until it expires, a day by default.
 
+licensebox manages licensing and access. Admins decide who gets access;
+any payments or billing are handled separately by the product's team.
+
 ```
 go get licensebox.dev/client
 ```
@@ -33,8 +36,8 @@ if _, err := lic.Require(ctx, "export"); err != nil {
 - `lease`: the lease format, for checking leases without the client.
 - `cmd/signin`: signs in to a product and prints the lease, for trying a
   product's set-up.
-- `admin`: the admin API, for automating what admins do, as granting a
-  module when a payment comes in.
+- `admin`: the admin API, for automating access decisions such as granting
+  modules after an admin approves a request.
 - `cmd/licensebox`: the admin command: create products, grant modules,
   revoke users and machines.
 

@@ -2,7 +2,7 @@
 // changing products, their signing keys and admins, and managing their
 // users: grants, revocations, activity and numbers. The licensebox
 // command is built on it; use it to automate the same, as granting a
-// module when a payment comes in.
+// module after an admin approves a request.
 //
 //	a := admin.New(token)
 //	_, err := a.Grant(ctx, "myapp", admin.GrantRequest{Email: "ada@example.org", Modules: []string{"export"}})
