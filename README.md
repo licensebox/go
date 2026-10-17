@@ -1,8 +1,9 @@
 # licensebox for Go
 
 The Go client for [licensebox](https://licensebox.dev): your app signs the
-user in once, by email, then checks a signed lease offline on every run and
-renews it by itself.
+user in once, by email, then checks the licence with licensebox at every
+run. When licensebox can't be reached, the signed lease kept on the machine
+lets the app run offline until it expires, a day by default.
 
 ```
 go get licensebox.dev/client
@@ -23,7 +24,7 @@ if _, err := lic.Require(ctx, "export"); err != nil {
 ```
 
 - `client`: sign-in, storage of the lease and the installation's key,
-  offline checks, renewal.
+  checks at every run, offline checks.
 - `lease`: the lease format, for checking leases without the client.
 - `cmd/signin`: signs in to a product and prints the lease, for trying a
   product's set-up.

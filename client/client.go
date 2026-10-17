@@ -1,6 +1,7 @@
 // Package client is how an app uses licensebox: it signs the user in
-// once, keeps the lease it gets, checks it offline on every run, renews
-// it before it expires, and tells the app which modules it may run.
+// once, keeps the lease it gets, checks it with the server at every run
+// (and offline, for a day, when the server cannot be reached), and tells
+// the app which modules it may run.
 //
 //	lic, err := client.New(client.Config{Product: "edgewise", Keys: keys})
 //	...
@@ -26,6 +27,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"licensebox.dev/lease"
@@ -34,8 +36,9 @@ import (
 // DefaultServer is the licensebox server.
 const DefaultServer = "https://licensebox.dev"
 
-// renewBefore is how long before a lease expires the app renews it.
-const renewBefore = 7 * 24 * time.Hour
+// checkTimeout bounds the check with the server at each run, after
+// which the lease kept is used as it is.
+const checkTimeout = 3 * time.Second
 
 // Config sets up a Client.
 type Config struct {
@@ -63,6 +66,10 @@ type Config struct {
 // Client holds a product's licence on this machine.
 type Client struct {
 	cfg Config
+
+	mu sync.Mutex
+	// checked is the lease the server gave this run, if it has.
+	checked *lease.Lease
 }
 
 // Errors.
@@ -74,6 +81,9 @@ var (
 	ErrDenied = errors.New("licensebox: sign-in refused")
 	// ErrSignInExpired is returned when a sign-in is not finished in time.
 	ErrSignInExpired = errors.New("licensebox: the sign-in expired before it was finished")
+	// ErrOffline is returned when the lease kept has expired and the
+	// server cannot be reached to renew it.
+	ErrOffline = errors.New("licensebox: the licence has expired and the licence server cannot be reached: connect to the internet and run again")
 )
 
 // ModuleError is returned by Require for a module the lease leaves out.
@@ -110,7 +120,7 @@ func New(cfg Config) (*Client, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	return &Client{cfg}, nil
+	return &Client{cfg: cfg}, nil
 }
 
 func (c *Client) leasePath() string { return filepath.Join(c.cfg.Dir, "lease") }
@@ -170,64 +180,87 @@ func decodeSeed(s string) (ed25519.PrivateKey, error) {
 	return ed25519.NewKeyFromSeed(b), nil
 }
 
-// Lease returns a valid lease: the one kept, renewed first if it is near
-// its end or past it, or a new one from signing in.
+// Lease returns a valid lease. The first call in a run renews the lease
+// kept with the server, so that every run sees grants and revocations as
+// they are; if the server is not reached within a few seconds, the lease
+// kept is used until it expires, and after that ErrOffline is returned.
+// With no lease, or one the server will not renew, the user signs in.
+// Later calls in the same run return the lease the server gave.
 func (c *Client) Lease(ctx context.Context) (lease.Lease, error) {
-	now := c.cfg.Now()
-	if token := c.stored(); token != "" {
-		l, err := lease.Check(token, c.cfg.Product, c.cfg.Keys, now)
-		switch {
-		case err == nil && l.Expires.Sub(now) > renewBefore:
-			return l, nil
-		case err == nil:
-			// Near its end: renewed if the server is reached soon,
-			// else used as it is.
-			rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			nl, rerr := c.renew(rctx, token)
-			cancel()
-			if rerr == nil {
-				return nl, nil
-			}
-			if errors.Is(rerr, ErrRevoked) {
-				return lease.Lease{}, rerr
-			}
-			return l, nil
-		case errors.Is(err, lease.ErrExpired):
-			nl, rerr := c.renew(ctx, token)
-			if rerr == nil {
-				return nl, nil
-			}
-			if errors.Is(rerr, ErrRevoked) {
-				return lease.Lease{}, rerr
-			}
-		}
-	}
-	return c.SignIn(ctx)
+	l, _, err := c.lease(ctx)
+	return l, err
 }
 
-// Require returns the lease if it lets this installation run the module,
-// renewing it once first if it does not, in case the module was granted
-// since; otherwise a *ModuleError, or ErrRevoked if the renewal is
-// refused.
+// lease is Lease, and whether the server gave the lease this run.
+func (c *Client) lease(ctx context.Context) (lease.Lease, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.checked != nil && c.cfg.Now().Before(c.checked.Expires) {
+		return *c.checked, true, nil
+	}
+	token := c.stored()
+	if token == "" {
+		return c.signIn(ctx)
+	}
+	kept, kerr := lease.Check(token, c.cfg.Product, c.cfg.Keys, c.cfg.Now())
+	if kerr != nil && !errors.Is(kerr, lease.ErrExpired) {
+		return c.signIn(ctx) // damaged, or from another product or key
+	}
+	rctx, cancel := context.WithTimeout(ctx, checkTimeout)
+	l, err := c.renew(rctx, token)
+	cancel()
+	var e *apiError
+	switch {
+	case err == nil:
+		c.checked = &l
+		return l, true, nil
+	case errors.Is(err, ErrRevoked):
+		return lease.Lease{}, false, err
+	case errors.As(err, &e) && e.Code == "invalid_lease":
+		// Expired too long ago, or signed by a retired key.
+		return c.signIn(ctx)
+	case kerr == nil:
+		return kept, false, nil // offline: the lease kept holds until it expires
+	case errors.As(err, &e):
+		return lease.Lease{}, false, err // as the clock being off
+	default:
+		return lease.Lease{}, false, fmt.Errorf("%w (%v)", ErrOffline, err)
+	}
+}
+
+func (c *Client) signIn(ctx context.Context) (lease.Lease, bool, error) {
+	l, err := c.SignIn(ctx)
+	if err != nil {
+		return l, false, err
+	}
+	c.checked = &l
+	return l, true, nil
+}
+
+// Require returns the lease if it lets this installation run the module;
+// otherwise a *ModuleError, or the error Lease returns. If the lease
+// could not be renewed this run, it is tried once more first, in case
+// the module was granted since.
 func (c *Client) Require(ctx context.Context, module string) (lease.Lease, error) {
-	l, err := c.Lease(ctx)
+	l, fresh, err := c.lease(ctx)
 	if err != nil {
 		return l, err
 	}
-	if l.Has(module) {
-		return l, nil
-	}
-	nl, err := c.renew(ctx, c.stored())
-	switch {
-	case err == nil:
-		l = nl
-		if l.Has(module) {
-			return l, nil
+	if !l.Has(module) && !fresh {
+		c.mu.Lock()
+		nl, err := c.renew(ctx, c.stored())
+		if err == nil {
+			c.checked, l = &nl, nl
 		}
-	case errors.Is(err, ErrRevoked):
-		return lease.Lease{}, err
+		c.mu.Unlock()
+		if errors.Is(err, ErrRevoked) {
+			return lease.Lease{}, err
+		}
 	}
-	return l, &ModuleError{Product: c.cfg.Product, Module: module, Email: l.Email}
+	if !l.Has(module) {
+		return l, &ModuleError{Product: c.cfg.Product, Module: module, Email: l.Email}
+	}
+	return l, nil
 }
 
 // Status returns the lease kept and whether it is valid now, without
@@ -242,6 +275,14 @@ func (c *Client) Status() (lease.Lease, error) {
 
 // Logout removes the lease kept; the installation key stays.
 func (c *Client) Logout() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.forget()
+}
+
+// forget removes the lease kept and this run's; c.mu is held.
+func (c *Client) forget() error {
+	c.checked = nil
 	err := os.Remove(c.leasePath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -314,7 +355,7 @@ func (c *Client) renew(ctx context.Context, token string) (lease.Lease, error) {
 	if err := c.post(ctx, "/v1/renew", req, &resp); err != nil {
 		var e *apiError
 		if errors.As(err, &e) && e.Code == "revoked" {
-			c.Logout()
+			c.forget()
 			return lease.Lease{}, ErrRevoked
 		}
 		return lease.Lease{}, err
