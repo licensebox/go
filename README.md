@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/logo-dark.png">
+  <img alt="licensebox" src=".github/logo-light.png" width="400">
+</picture>
+
 # licensebox for Go
 
 The Go client for [licensebox](https://licensebox.dev): your app signs the
