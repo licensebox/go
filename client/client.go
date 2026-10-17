@@ -354,6 +354,8 @@ func (c *Client) Logout() error {
 // forget removes the lease kept and this run's; c.mu is held.
 func (c *Client) forget() error {
 	c.checked = nil
+	os.Remove(c.usagePath())
+	os.Remove(c.usageOnPath())
 	err := os.Remove(c.leasePath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -405,30 +407,44 @@ func (c *Client) post(ctx context.Context, path string, in, out any) error {
 	return json.Unmarshal(data, out)
 }
 
-// renew trades the lease for a fresh one, signed by this installation's
-// key, and keeps it.
+// call sends a call signed with this installation's key, as the holder
+// of the lease token: its kind, the lease, the time and the payload, as
+// JSON, are signed together (lease.CallMessage).
+func (c *Client) call(ctx context.Context, kind, token string, payload, out any) error {
+	key, err := c.installKey()
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	t := c.cfg.Now().UTC().Truncate(time.Second)
+	req := map[string]any{
+		"lease": token, "time": t, "version": c.cfg.Version, "payload": string(body),
+		"signature": lease.EncodeSignature(ed25519.Sign(key, lease.CallMessage(kind, token, t, body))),
+	}
+	err = c.post(ctx, "/v1/"+kind, req, out)
+	var e *apiError
+	if errors.As(err, &e) && e.Code == "revoked" {
+		c.forget()
+		return ErrRevoked
+	}
+	return err
+}
+
+// renew trades the lease for a fresh one, and keeps it, sending the
+// usage counted since the last renewal if the product collects it.
 func (c *Client) renew(ctx context.Context, token string) (lease.Lease, error) {
 	if token == "" {
 		return lease.Lease{}, errors.New("licensebox: no lease")
 	}
-	key, err := c.installKey()
-	if err != nil {
-		return lease.Lease{}, err
-	}
-	t := c.cfg.Now().UTC().Truncate(time.Second)
-	req := map[string]any{
-		"lease": token, "time": t, "version": c.cfg.Version,
-		"signature": lease.EncodeSignature(ed25519.Sign(key, lease.RenewMessage(token, t))),
-	}
+	sent := c.pendingUsage()
 	var resp struct {
 		Lease string `json:"lease"`
+		Usage bool   `json:"usage"`
 	}
-	if err := c.post(ctx, "/v1/renew", req, &resp); err != nil {
-		var e *apiError
-		if errors.As(err, &e) && e.Code == "revoked" {
-			c.forget()
-			return lease.Lease{}, ErrRevoked
-		}
+	if err := c.call(ctx, "renew", token, map[string]any{"usage": sent}, &resp); err != nil {
 		return lease.Lease{}, err
 	}
 	l, err := lease.Check(resp.Lease, c.cfg.Product, c.cfg.Keys, c.now())
@@ -438,6 +454,7 @@ func (c *Client) renew(ctx context.Context, token string) (lease.Lease, error) {
 	if !c.own(l) {
 		return lease.Lease{}, errors.New("licensebox: the server sent a lease for another machine")
 	}
+	c.usageSent(sent, resp.Usage)
 	return l, c.save(resp.Lease)
 }
 
@@ -485,6 +502,7 @@ func (c *Client) SignIn(ctx context.Context) (lease.Lease, error) {
 		}
 		var resp struct {
 			Lease string `json:"lease"`
+			Usage bool   `json:"usage"`
 		}
 		err := c.post(ctx, "/v1/token", map[string]string{"device_code": d.DeviceCode}, &resp)
 		var e *apiError
@@ -497,6 +515,10 @@ func (c *Client) SignIn(ctx context.Context) (lease.Lease, error) {
 			if !c.own(l) {
 				return lease.Lease{}, errors.New("licensebox: the server sent a lease for another machine")
 			}
+			if old, _, _, err := lease.Parse(c.stored()); err == nil && old.User != l.User {
+				os.Remove(c.usagePath())
+			}
+			c.usageSent(nil, resp.Usage)
 			if err := c.save(resp.Lease); err != nil {
 				return lease.Lease{}, err
 			}

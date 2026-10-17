@@ -38,6 +38,8 @@ Products:
   product ID [settings]               change settings; those not given are kept
       settings: -name, -modules a,b, -free a, -trial b, -trial-days N,
                 -lease-hours N, -terms N, -terms-url URL, -contact EMAIL
+      -describe "module: what it is for" (again for each), -hidden a,
+                -usage on|off (collect counts of the commands apps run)
   key add ID                          a new signing key, current from now
   key retire ID KID                   remove an old key
   admin add ID EMAIL                  let someone manage the product
@@ -51,8 +53,13 @@ Users:
   revoke ID EMAIL [-note text]        refuse the user's apps from their next check
   revoke ID -machine KEY              refuse one machine
   restore ID EMAIL | -machine KEY
+  requests ID [-all]                  requests for modules, waiting or all
+  approve ID REQUEST [MODULE...]      grant what was asked, or the modules given
+                                      [-until 2027-01-31 | -days N] [-note text]
+  decline ID REQUEST [-note text]     say no, telling them why
   events ID [-n 50]                   the latest activity
   stats ID                            users and machines
+  usage ID [-days 30]                 commands run, by command, user and version
 
 Operators:
   allowed | allow EMAIL | disallow EMAIL   who may create products
@@ -216,6 +223,88 @@ func Run(ctx context.Context, args []string, env Env) error {
 				fmt.Fprintf(r.tw, "  version %s\t%d\n", dash(v), st.Versions[v])
 			}
 		})
+	case "requests":
+		fs := flags("requests")
+		all := fs.Bool("all", false, "answered ones too")
+		pos, err := parse(fs, rest, 1, "requests ID [-all]")
+		if err != nil {
+			return err
+		}
+		status := "pending"
+		if *all {
+			status = ""
+		}
+		rs, err := c.Requests(ctx, pos[0], status)
+		return r.show(rs, err, func() {
+			if len(rs) == 0 {
+				fmt.Fprintln(r.tw, "No requests waiting.")
+				return
+			}
+			fmt.Fprintln(r.tw, "REQUEST\tEMAIL\tMODULES\tASKED\tSTATUS\tNOTE")
+			for _, q := range rs {
+				fmt.Fprintf(r.tw, "%s\t%s\t%s\t%s\t%s\t%s\n", q.ID, q.Email, list(q.Modules), date(q.Created), q.Status, oneLine(q.Note))
+			}
+		})
+	case "approve", "decline":
+		fs := flags(cmd)
+		untilFlag := fs.String("until", "", "the last day, as 2027-01-31")
+		days := fs.Int("days", 0, "for this many days from now")
+		note := fs.String("note", "", "a note sent to the user")
+		use := cmd + " ID REQUEST [MODULE...]"
+		pos, err := parse(fs, rest, -2, use)
+		if err != nil {
+			return err
+		}
+		var q admin.Request
+		if cmd == "decline" {
+			q, err = c.Decline(ctx, pos[0], pos[1], *note)
+		} else {
+			a := admin.Answer{Modules: pos[2:], Note: *note}
+			switch {
+			case *untilFlag != "" && *days != 0:
+				return errors.New("give -until or -days, not both")
+			case *untilFlag != "":
+				d, err := time.Parse(time.DateOnly, *untilFlag)
+				if err != nil {
+					return errors.New("-until: a date, as 2027-01-31")
+				}
+				a.Until = d.AddDate(0, 0, 1)
+			case *days > 0:
+				a.Until = time.Now().AddDate(0, 0, *days)
+			}
+			q, err = c.Approve(ctx, pos[0], pos[1], a)
+		}
+		return r.show(q, err, func() {
+			if q.Status == "approved" {
+				fmt.Fprintf(r.tw, "Approved: %s has %s %s, and was told by email.\n", q.Email, list(q.Granted), until(q.Until))
+			} else {
+				fmt.Fprintf(r.tw, "Declined: %s was told by email.\n", q.Email)
+			}
+		})
+	case "usage":
+		fs := flags("usage")
+		days := fs.Int("days", 30, "how many days back")
+		pos, err := parse(fs, rest, 1, "usage ID [-days 30]")
+		if err != nil {
+			return err
+		}
+		u, err := c.Usage(ctx, pos[0], *days)
+		return r.show(u, err, func() {
+			fmt.Fprintf(r.tw, "Since %s: %d runs, %d failed.\n\n", u.Since, u.Runs, u.Failed)
+			for _, part := range []struct {
+				title string
+				lines []admin.UsageLine
+			}{{"COMMAND", u.Commands}, {"USER", u.Users}, {"VERSION", u.Versions}} {
+				if len(part.lines) == 0 {
+					continue
+				}
+				fmt.Fprintf(r.tw, "%s\tRUNS\tFAILED\tUSERS\tMEAN TIME\n", part.title)
+				for _, l := range part.lines {
+					fmt.Fprintf(r.tw, "%s\t%d\t%d\t%d\t%.1f s\n", dash(l.Name), l.Runs, l.Failed, l.Users, float64(l.Millis)/1000)
+				}
+				fmt.Fprintln(r.tw)
+			}
+		})
 	case "allowed":
 		as, err := c.Allowed(ctx)
 		return r.show(as, err, func() {
@@ -328,7 +417,17 @@ func settings(fs *flag.FlagSet) func(s *admin.Settings) {
 	leaseHours := fs.Int("lease-hours", 0, "how long apps run offline (24 if 0)")
 	terms := fs.Int("terms", 0, "the version of the terms users accept")
 	termsURL := fs.String("terms-url", "", "where the terms are")
-	contact := fs.String("contact", "", "where users ask for modules")
+	contact := fs.String("contact", "", "shown where users are refused")
+	var describe []string
+	fs.Func("describe", `what a module is for, as "export: export to STEP"`, func(v string) error {
+		if !strings.Contains(v, ":") {
+			return errors.New(`want "module: what it is for"`)
+		}
+		describe = append(describe, v)
+		return nil
+	})
+	hidden := fs.String("hidden", "", "modules users don't see nor can ask for, comma-separated")
+	usage := fs.String("usage", "", "on or off: collect counts of the commands apps run")
 	return func(s *admin.Settings) {
 		fs.Visit(func(f *flag.Flag) {
 			switch f.Name {
@@ -350,6 +449,22 @@ func settings(fs *flag.FlagSet) func(s *admin.Settings) {
 				s.TermsURL = *termsURL
 			case "contact":
 				s.Contact = *contact
+			case "describe":
+				if s.Descriptions == nil {
+					s.Descriptions = map[string]string{}
+				}
+				for _, d := range describe {
+					m, text, _ := strings.Cut(d, ":")
+					if text = strings.TrimSpace(text); text == "" {
+						delete(s.Descriptions, strings.TrimSpace(m))
+					} else {
+						s.Descriptions[strings.TrimSpace(m)] = text
+					}
+				}
+			case "hidden":
+				s.Hidden = split(*hidden)
+			case "usage":
+				s.Usage = *usage == "on"
 			}
 		})
 	}
@@ -402,8 +517,20 @@ func (r runner) product(args []string) error {
 }
 
 func (r runner) settings(p admin.Product) {
-	fmt.Fprintf(r.tw, "id\t%s\nname\t%s\nmodules\t%s\nfree\t%s\ntrial\t%s\noffline\t%d hours\nterms\t%s\ncontact\t%s\n",
-		p.ID, p.Name, list(p.Modules), list(p.Free), trial(p.Settings), hours(p.LeaseHours), terms(p.Settings), dash(p.Contact))
+	fmt.Fprintf(r.tw, "id\t%s\nname\t%s\nmodules\t%s\nfree\t%s\nhidden\t%s\ntrial\t%s\noffline\t%d hours\nterms\t%s\ncontact\t%s\nusage\t%s\n",
+		p.ID, p.Name, list(p.Modules), list(p.Free), list(p.Hidden), trial(p.Settings), hours(p.LeaseHours), terms(p.Settings), dash(p.Contact), onOff(p.Usage))
+	for _, m := range p.Modules {
+		if d := p.Descriptions[m]; d != "" {
+			fmt.Fprintf(r.tw, "  %s\t%s\n", m, d)
+		}
+	}
+}
+
+func onOff(b bool) string {
+	if b {
+		return "collected"
+	}
+	return "off"
 }
 
 // config prints the client configuration an app carries.
@@ -589,6 +716,14 @@ func split(s string) []string {
 }
 
 func list(s []string) string { return dash(strings.Join(s, ",")) }
+
+func oneLine(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 60 {
+		s = s[:57] + "..."
+	}
+	return s
+}
 
 func dash(s string) string {
 	if s == "" {

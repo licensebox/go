@@ -12,7 +12,9 @@ package lease
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -116,15 +118,14 @@ func Check(token, product string, keys Keys, now time.Time) (Lease, error) {
 	return l, nil
 }
 
-// renewPrefix is signed with a renewal request, by the installation's
-// key.
-const renewPrefix = "licensebox renew v1\n"
-
-// RenewMessage returns what an installation signs to renew a lease at
-// time t: the token and the time, so that a renewal cannot be replayed
-// much later.
-func RenewMessage(token string, t time.Time) []byte {
-	return []byte(renewPrefix + strings.TrimSpace(token) + "\n" + t.UTC().Format(time.RFC3339))
+// CallMessage returns what an installation signs to call the server
+// with its lease at time t: the kind of call (as "renew" or "request"),
+// the lease, the time, and a hash of the call's payload, so that a call
+// can be neither replayed much later, nor made for another lease, nor
+// given another payload.
+func CallMessage(kind, token string, t time.Time, payload []byte) []byte {
+	h := sha256.Sum256(payload)
+	return []byte("licensebox " + kind + " v1\n" + strings.TrimSpace(token) + "\n" + t.UTC().Format(time.RFC3339) + "\n" + hex.EncodeToString(h[:]))
 }
 
 // devicePrefix is signed with a sign-in request, by the installation's

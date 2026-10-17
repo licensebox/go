@@ -35,6 +35,9 @@ type server struct {
 	polls    int
 	signIns  int
 	renewals int
+	usageOn  bool
+	usage    map[string]int // runs counted, by command
+	requests [][]string
 }
 
 func (s *server) issue(machine string) string {
@@ -78,8 +81,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.signIns++
-		json.NewEncoder(w).Encode(map[string]string{"lease": s.issue(strings.TrimPrefix(req["device_code"], "dc:"))})
-	case "/v1/renew":
+		json.NewEncoder(w).Encode(map[string]any{"lease": s.issue(strings.TrimPrefix(req["device_code"], "dc:")), "usage": s.usageOn})
+	case "/v1/renew", "/v1/modules", "/v1/request":
 		l, err := lease.Check(req["lease"], "myapp", lease.Keys{"k1": s.key.Public().(ed25519.PublicKey)}, time.Time{})
 		if err != nil && !errors.Is(err, lease.ErrExpired) {
 			fail(http.StatusBadRequest, "invalid_lease")
@@ -88,7 +91,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		t, _ := time.Parse(time.RFC3339, req["time"])
 		key, _ := lease.DecodeKey(l.Machine)
 		sig, _ := lease.DecodeSignature(req["signature"])
-		if !ed25519.Verify(key, lease.RenewMessage(req["lease"], t), sig) {
+		kind := strings.TrimPrefix(r.URL.Path, "/v1/")
+		if !ed25519.Verify(key, lease.CallMessage(kind, req["lease"], t, []byte(req["payload"])), sig) {
 			fail(http.StatusUnauthorized, "invalid_signature")
 			return
 		}
@@ -96,8 +100,29 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fail(http.StatusForbidden, "revoked")
 			return
 		}
-		s.renewals++
-		json.NewEncoder(w).Encode(map[string]string{"lease": s.issue(l.Machine)})
+		switch kind {
+		case "renew":
+			var p struct{ Usage []UsageCount }
+			json.Unmarshal([]byte(req["payload"]), &p)
+			for _, u := range p.Usage {
+				if s.usage == nil {
+					s.usage = map[string]int{}
+				}
+				s.usage[u.Command] += u.OK + u.Failed
+			}
+			s.renewals++
+			json.NewEncoder(w).Encode(map[string]any{"lease": s.issue(l.Machine), "usage": s.usageOn})
+		case "modules":
+			json.NewEncoder(w).Encode([]Module{{Name: "core", Free: true, Have: true}, {Name: "export", Description: "exporting"}})
+		case "request":
+			var p struct {
+				Modules []string
+				Note    string
+			}
+			json.Unmarshal([]byte(req["payload"]), &p)
+			s.requests = append(s.requests, p.Modules)
+			json.NewEncoder(w).Encode(Request{ID: "r1", Modules: p.Modules, Note: p.Note, Status: "pending"})
+		}
 	default:
 		http.NotFound(w, r)
 	}
@@ -356,5 +381,55 @@ func TestUnsignedDeviceRequest(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("an unsigned sign-in request: %d", resp.StatusCode)
+	}
+}
+
+func TestUsage(t *testing.T) {
+	st := newSetup(t)
+	ctx := context.Background()
+	st.srv.set(func(s *server) { s.usageOn = true })
+	c := st.run(t)
+	if _, err := c.Lease(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c.Record("export", true, time.Second)
+	c.Record("export", false, time.Second)
+	c.Record("batch", true, time.Second)
+	if _, err := st.run(t).Lease(ctx); err != nil {
+		t.Fatal(err)
+	}
+	st.srv.mu.Lock()
+	got := st.srv.usage
+	st.srv.mu.Unlock()
+	if got["export"] != 2 || got["batch"] != 1 {
+		t.Errorf("usage sent %v", got)
+	}
+	if _, err := os.Stat(filepath.Join(st.dir, "usage.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Error("usage kept after it was sent")
+	}
+	// A product that doesn't collect usage: nothing is counted.
+	st.srv.set(func(s *server) { s.usageOn = false; s.usage = nil })
+	st.run(t).Lease(ctx)
+	c = st.run(t)
+	c.Record("export", true, time.Second)
+	if _, err := os.Stat(filepath.Join(st.dir, "usage.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Error("usage counted for a product that doesn't collect it")
+	}
+}
+
+func TestAccess(t *testing.T) {
+	st := newSetup(t)
+	ctx := context.Background()
+	c := st.run(t)
+	ms, err := c.Modules(ctx)
+	if err != nil || len(ms) != 2 || ms[1].Name != "export" || ms[1].Have {
+		t.Fatalf("modules %+v %v", ms, err)
+	}
+	r, err := c.RequestAccess(ctx, []string{"export"}, "for work")
+	if err != nil || r.Status != "pending" || r.Note != "for work" {
+		t.Fatalf("request %+v %v", r, err)
+	}
+	if len(st.srv.requests) != 1 {
+		t.Errorf("requests at the server %v", st.srv.requests)
 	}
 }

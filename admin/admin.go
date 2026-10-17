@@ -85,8 +85,60 @@ type Settings struct {
 	// Terms is the version of the terms users accept, at TermsURL.
 	Terms    int    `json:"terms"`
 	TermsURL string `json:"terms_url"`
-	// Contact is where users ask for modules.
+	// Contact is shown where users are refused.
 	Contact string `json:"contact"`
+	// Descriptions say what each module is for, as users asking for
+	// access see it; Hidden modules users neither see nor can ask for.
+	Descriptions map[string]string `json:"descriptions"`
+	Hidden       []string          `json:"hidden"`
+	// Usage is whether apps send counts of the commands they run.
+	Usage bool `json:"usage"`
+}
+
+// Request is a user's request for modules, and its answer.
+type Request struct {
+	ID      string    `json:"id"`
+	Email   string    `json:"email"`
+	Modules []string  `json:"modules"`
+	Note    string    `json:"note"`
+	Created time.Time `json:"created"`
+	// Status is "pending", "approved" or "declined".
+	Status     string    `json:"status"`
+	Granted    []string  `json:"granted"`
+	Until      time.Time `json:"until"`
+	Answer     string    `json:"answer"`
+	AnsweredBy string    `json:"answered_by"`
+	Answered   time.Time `json:"answered"`
+}
+
+// Answer approves a request, for all its modules or those given, until
+// a time if Until is not zero, or declines it; Note is sent to the user.
+type Answer struct {
+	Modules []string  `json:"modules"`
+	Until   time.Time `json:"until"`
+	Note    string    `json:"note"`
+}
+
+// UsageReport sums a product's usage over the days since Since.
+type UsageReport struct {
+	Since    string         `json:"since"`
+	Runs     int            `json:"runs"`
+	Failed   int            `json:"failed"`
+	Days     []UsageLine    `json:"days"`
+	Commands []UsageLine    `json:"commands"`
+	Users    []UsageLine    `json:"users"`
+	Versions []UsageLine    `json:"versions"`
+	Systems  map[string]int `json:"systems"`
+}
+
+// UsageLine is the runs of one day, command, user or version: Millis is
+// the mean time a run took, Users how many users ran it.
+type UsageLine struct {
+	Name   string `json:"name"`
+	Runs   int    `json:"runs"`
+	Failed int    `json:"failed"`
+	Millis int64  `json:"ms"`
+	Users  int    `json:"users"`
 }
 
 // Key is one of a product's signing keys: the public half, as apps carry
@@ -380,6 +432,31 @@ func (c *Client) Events(ctx context.Context, product string, limit int) ([]Event
 func (c *Client) Stats(ctx context.Context, product string) (Stats, error) {
 	var st Stats
 	return st, c.do(ctx, "GET", p("products", product, "stats"), nil, &st)
+}
+
+// Requests returns the product's requests, newest first: those of the
+// status given ("pending", "approved", "declined"), or all with "".
+func (c *Client) Requests(ctx context.Context, product, status string) ([]Request, error) {
+	var rs []Request
+	return rs, c.do(ctx, "GET", p("products", product, "requests")+"?status="+url.QueryEscape(status), nil, &rs)
+}
+
+// Approve grants a request's modules, or those of them in a, and tells
+// the user; Decline tells them no.
+func (c *Client) Approve(ctx context.Context, product, id string, a Answer) (Request, error) {
+	var r Request
+	return r, c.do(ctx, "POST", p("products", product, "requests", id, "approve"), a, &r)
+}
+
+func (c *Client) Decline(ctx context.Context, product, id, note string) (Request, error) {
+	var r Request
+	return r, c.do(ctx, "POST", p("products", product, "requests", id, "decline"), Answer{Note: note}, &r)
+}
+
+// Usage sums the product's usage over the last days, 30 if days is 0.
+func (c *Client) Usage(ctx context.Context, product string, days int) (UsageReport, error) {
+	var u UsageReport
+	return u, c.do(ctx, "GET", p("products", product, "usage")+"?days="+strconv.Itoa(days), nil, &u)
 }
 
 // Allowed lists who may create products, for operators; Allow and
