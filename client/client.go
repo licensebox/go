@@ -135,39 +135,101 @@ func (c *Client) stored() string {
 	return strings.TrimSpace(string(b))
 }
 
-func (c *Client) save(token string) error {
+func (c *Client) save(token string) error { return c.write(c.leasePath(), token) }
+
+// write replaces a file whole, through a file of its own, so that two
+// runs at once never leave it half written.
+func (c *Client) write(path, content string) error {
 	if err := os.MkdirAll(c.cfg.Dir, 0o700); err != nil {
 		return err
 	}
-	tmp := c.leasePath() + ".tmp"
-	if err := os.WriteFile(tmp, []byte(token+"\n"), 0o600); err != nil {
+	f, err := os.CreateTemp(c.cfg.Dir, ".tmp-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, c.leasePath())
+	_, err = f.WriteString(content + "\n")
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Chmod(f.Name(), 0o600)
+	}
+	if err == nil {
+		err = os.Rename(f.Name(), path)
+	}
+	if err != nil {
+		os.Remove(f.Name())
+	}
+	return err
 }
 
-// installKey returns this installation's key, made on first use.
-func (c *Client) installKey() (ed25519.PrivateKey, error) {
-	if b, err := os.ReadFile(c.keyPath()); err == nil {
-		k, err := decodeSeed(strings.TrimSpace(string(b)))
-		if err != nil {
-			return nil, fmt.Errorf("licensebox: %s is damaged; remove it to sign in again", c.keyPath())
+func (c *Client) seenPath() string { return filepath.Join(c.cfg.Dir, "seen") }
+
+// now is the clock, but never earlier than the latest time this
+// installation has seen: a clock turned back does not make an expired
+// lease valid again.
+func (c *Client) now() time.Time {
+	t := c.cfg.Now()
+	if b, err := os.ReadFile(c.seenPath()); err == nil {
+		if seen, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(b))); err == nil && seen.After(t) {
+			return seen
 		}
-		return k, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
 	}
-	_, key, err := ed25519.GenerateKey(nil)
-	if err != nil {
-		return nil, err
+	c.write(c.seenPath(), t.UTC().Format(time.RFC3339Nano))
+	return t
+}
+
+// own reports whether the lease names this installation's key.
+func (c *Client) own(l lease.Lease) bool {
+	key, err := c.installKey()
+	return err == nil && l.Machine == lease.EncodeKey(key.Public().(ed25519.PublicKey))
+}
+
+// installKey returns this installation's key, made on first use. Two
+// runs making it at once agree on one: the key file is created only if
+// it is not there, and a run that finds another's still being written
+// waits for it.
+func (c *Client) installKey() (ed25519.PrivateKey, error) {
+	for range 40 {
+		b, err := os.ReadFile(c.keyPath())
+		if err == nil {
+			if k, err := decodeSeed(strings.TrimSpace(string(b))); err == nil {
+				return k, nil
+			}
+			if info, err := os.Stat(c.keyPath()); err == nil && time.Since(info.ModTime()) > 5*time.Second {
+				return nil, fmt.Errorf("licensebox: %s is damaged; remove it to sign in again", c.keyPath())
+			}
+			time.Sleep(25 * time.Millisecond) // another run is writing it
+			continue
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		_, key, err := ed25519.GenerateKey(nil)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.MkdirAll(c.cfg.Dir, 0o700); err != nil {
+			return nil, err
+		}
+		f, err := os.OpenFile(c.keyPath(), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if errors.Is(err, os.ErrExist) {
+			continue // another run made it first
+		}
+		if err != nil {
+			return nil, err
+		}
+		_, err = f.WriteString(encodeSeed(key) + "\n")
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			os.Remove(c.keyPath())
+			return nil, err
+		}
+		return key, nil
 	}
-	if err := os.MkdirAll(c.cfg.Dir, 0o700); err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(c.keyPath(), []byte(encodeSeed(key)+"\n"), 0o600); err != nil {
-		return nil, err
-	}
-	return key, nil
+	return nil, fmt.Errorf("licensebox: %s is damaged; remove it to sign in again", c.keyPath())
 }
 
 func encodeSeed(k ed25519.PrivateKey) string { return base64.RawURLEncoding.EncodeToString(k.Seed()) }
@@ -195,16 +257,17 @@ func (c *Client) Lease(ctx context.Context) (lease.Lease, error) {
 func (c *Client) lease(ctx context.Context) (lease.Lease, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.checked != nil && c.cfg.Now().Before(c.checked.Expires) {
+	now := c.now()
+	if c.checked != nil && now.Before(c.checked.Expires) {
 		return *c.checked, true, nil
 	}
 	token := c.stored()
 	if token == "" {
 		return c.signIn(ctx)
 	}
-	kept, kerr := lease.Check(token, c.cfg.Product, c.cfg.Keys, c.cfg.Now())
-	if kerr != nil && !errors.Is(kerr, lease.ErrExpired) {
-		return c.signIn(ctx) // damaged, or from another product or key
+	kept, kerr := lease.Check(token, c.cfg.Product, c.cfg.Keys, now)
+	if kerr != nil && !errors.Is(kerr, lease.ErrExpired) || !c.own(kept) {
+		return c.signIn(ctx) // damaged, from another product or key, or copied from another machine
 	}
 	rctx, cancel := context.WithTimeout(ctx, checkTimeout)
 	l, err := c.renew(rctx, token)
@@ -216,8 +279,12 @@ func (c *Client) lease(ctx context.Context) (lease.Lease, bool, error) {
 		return l, true, nil
 	case errors.Is(err, ErrRevoked):
 		return lease.Lease{}, false, err
-	case errors.As(err, &e) && e.Code == "invalid_lease":
-		// Expired too long ago, or signed by a retired key.
+	case errors.As(err, &e) && (e.Code == "invalid_lease" || e.Code == "terms_changed"):
+		// Expired too long ago, signed by a retired key, or the terms
+		// changed and must be accepted again.
+		if e.Code == "terms_changed" {
+			fmt.Fprintln(c.cfg.Out, "The terms of use have changed.")
+		}
 		return c.signIn(ctx)
 	case kerr == nil:
 		return kept, false, nil // offline: the lease kept holds until it expires
@@ -270,7 +337,11 @@ func (c *Client) Status() (lease.Lease, error) {
 	if token == "" {
 		return lease.Lease{}, errors.New("licensebox: not signed in")
 	}
-	return lease.Check(token, c.cfg.Product, c.cfg.Keys, c.cfg.Now())
+	l, err := lease.Check(token, c.cfg.Product, c.cfg.Keys, c.now())
+	if err == nil && !c.own(l) {
+		return l, errors.New("licensebox: the lease kept is not this machine's")
+	}
+	return l, err
 }
 
 // Logout removes the lease kept; the installation key stays.
@@ -360,9 +431,12 @@ func (c *Client) renew(ctx context.Context, token string) (lease.Lease, error) {
 		}
 		return lease.Lease{}, err
 	}
-	l, err := lease.Check(resp.Lease, c.cfg.Product, c.cfg.Keys, c.cfg.Now())
+	l, err := lease.Check(resp.Lease, c.cfg.Product, c.cfg.Keys, c.now())
 	if err != nil {
 		return lease.Lease{}, err
+	}
+	if !c.own(l) {
+		return lease.Lease{}, errors.New("licensebox: the server sent a lease for another machine")
 	}
 	return l, c.save(resp.Lease)
 }
@@ -383,9 +457,11 @@ func (c *Client) SignIn(ctx context.Context) (lease.Lease, error) {
 		Interval                int    `json:"interval"`
 		IntervalMS              int64  `json:"interval_ms"`
 	}
-	req := map[string]string{
+	t := c.cfg.Now().UTC().Truncate(time.Second)
+	req := map[string]any{
 		"product": c.cfg.Product, "machine": lease.EncodeKey(key.Public().(ed25519.PublicKey)),
 		"os": runtime.GOOS, "arch": runtime.GOARCH, "version": c.cfg.Version,
+		"time": t, "signature": lease.EncodeSignature(ed25519.Sign(key, lease.DeviceMessage(c.cfg.Product, t))),
 	}
 	if err := c.post(ctx, "/v1/device", req, &d); err != nil {
 		return lease.Lease{}, err
@@ -414,9 +490,12 @@ func (c *Client) SignIn(ctx context.Context) (lease.Lease, error) {
 		var e *apiError
 		switch {
 		case err == nil:
-			l, err := lease.Check(resp.Lease, c.cfg.Product, c.cfg.Keys, c.cfg.Now())
+			l, err := lease.Check(resp.Lease, c.cfg.Product, c.cfg.Keys, c.now())
 			if err != nil {
 				return lease.Lease{}, err
+			}
+			if !c.own(l) {
+				return lease.Lease{}, errors.New("licensebox: the server sent a lease for another machine")
 			}
 			if err := c.save(resp.Lease); err != nil {
 				return lease.Lease{}, err

@@ -62,6 +62,13 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	json.NewDecoder(r.Body).Decode(&req)
 	switch r.URL.Path {
 	case "/v1/device":
+		t, _ := time.Parse(time.RFC3339, req["time"])
+		key, _ := lease.DecodeKey(req["machine"])
+		sig, _ := lease.DecodeSignature(req["signature"])
+		if key == nil || !ed25519.Verify(key, lease.DeviceMessage(req["product"], t), sig) {
+			fail(http.StatusUnauthorized, "invalid_signature")
+			return
+		}
 		s.polls = 0
 		json.NewEncoder(w).Encode(map[string]any{"device_code": "dc:" + req["machine"], "user_code": "WDJB-MJHT",
 			"verification_uri": "https://example.org/activate", "expires_in": 600, "interval_ms": 1})
@@ -269,4 +276,85 @@ func mustKey(t *testing.T) ed25519.PrivateKey {
 		t.Fatal(err)
 	}
 	return k
+}
+
+func TestClockTurnedBack(t *testing.T) {
+	st := newSetup(t)
+	ctx := context.Background()
+	if _, err := st.run(t).Lease(ctx); err != nil {
+		t.Fatal(err)
+	}
+	st.srv.set(func(s *server) { s.down = true })
+	*st.clock = st.clock.Add(30 * time.Hour) // past the lease, offline
+	if _, err := st.run(t).Lease(ctx); !errors.Is(err, ErrOffline) {
+		t.Fatalf("past the lease: %v", err)
+	}
+	*st.clock = st.clock.Add(-29 * time.Hour) // the clock turned back to within it
+	if _, err := st.run(t).Lease(ctx); !errors.Is(err, ErrOffline) {
+		t.Fatalf("with the clock turned back, the expired lease was used: %v", err)
+	}
+}
+
+func TestLeaseFromAnotherMachine(t *testing.T) {
+	a, b := newSetup(t), newSetup(t)
+	b.srv = a.srv
+	b.url = a.url
+	ctx := context.Background()
+	if _, err := a.run(t).Lease(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.run(t).Lease(ctx); err != nil { // b signs in, making its own key
+		t.Fatal(err)
+	}
+	token, _ := os.ReadFile(filepath.Join(a.dir, "lease"))
+	os.WriteFile(filepath.Join(b.dir, "lease"), token, 0o600)
+	if _, err := b.run(t).Status(); err == nil {
+		t.Error("Status accepted a lease copied from another machine")
+	}
+	if l, err := b.run(t).Lease(ctx); err != nil || !b.run(t).own(l) {
+		t.Errorf("a copied lease: %v", err)
+	}
+	if s, _ := a.srv.count(); s != 3 {
+		t.Errorf("%d sign-ins, want 3: the copied lease is replaced by signing in", s)
+	}
+}
+
+func TestOneInstallKey(t *testing.T) {
+	st := newSetup(t)
+	keys := make(chan string, 16)
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			k, err := st.run(t).installKey()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			keys <- lease.EncodeKey(k.Public().(ed25519.PublicKey))
+		}()
+	}
+	wg.Wait()
+	close(keys)
+	first := ""
+	for k := range keys {
+		if first == "" {
+			first = k
+		} else if k != first {
+			t.Fatal("runs at once made different install keys")
+		}
+	}
+}
+
+func TestUnsignedDeviceRequest(t *testing.T) {
+	st := newSetup(t)
+	resp, err := http.Post(st.url+"/v1/device", "application/json", strings.NewReader(`{"product":"myapp","machine":"AAAA"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("an unsigned sign-in request: %d", resp.StatusCode)
+	}
 }

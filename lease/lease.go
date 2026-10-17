@@ -127,6 +127,16 @@ func RenewMessage(token string, t time.Time) []byte {
 	return []byte(renewPrefix + strings.TrimSpace(token) + "\n" + t.UTC().Format(time.RFC3339))
 }
 
+// devicePrefix is signed with a sign-in request, by the installation's
+// key.
+const devicePrefix = "licensebox device v1\n"
+
+// DeviceMessage returns what an installation signs to start a sign-in for
+// a product at time t, proving it holds the key the lease will name.
+func DeviceMessage(product string, t time.Time) []byte {
+	return []byte(devicePrefix + product + "\n" + t.UTC().Format(time.RFC3339))
+}
+
 // EncodeKey and DecodeKey write and read a public key as base64url.
 func EncodeKey(k ed25519.PublicKey) string { return enc(k) }
 
