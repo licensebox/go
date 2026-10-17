@@ -29,6 +29,7 @@ Signing in:
   login [EMAIL]                       sign in with a code mailed to you
   logout                              sign out on this machine
   whoami                              who you are signed in as
+  version                             this program's release
 
 Products:
   products                            the products you manage
@@ -69,6 +70,8 @@ type Env struct {
 	// TokenFile is where the session is kept; empty means
 	// licensebox/admin-token in the user's configuration folder.
 	TokenFile string
+	// Version is the command's release.
+	Version string
 }
 
 func (e Env) tokenFile() (string, error) {
@@ -116,6 +119,10 @@ func Run(ctx context.Context, args []string, env Env) error {
 	r := runner{ctx: ctx, c: c, env: env, json: *asJSON, tw: tabwriter.NewWriter(env.Out, 0, 4, 2, ' ', 0)}
 	defer r.tw.Flush()
 	cmd, rest := top.Arg(0), top.Args()[1:]
+	if cmd == "version" {
+		fmt.Fprintln(env.Out, "licensebox", dash(env.Version))
+		return nil
+	}
 	if cmd != "login" && c.Token == "" {
 		return errors.New("not signed in: run licensebox login")
 	}

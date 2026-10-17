@@ -14,8 +14,11 @@ import (
 	"licensebox.dev/admin/cli"
 )
 
+// version is the release, set when it is built.
+var version = "dev"
+
 func main() {
-	env := cli.Env{In: os.Stdin, Out: os.Stdout, Getenv: os.Getenv}
+	env := cli.Env{In: os.Stdin, Out: os.Stdout, Getenv: os.Getenv, Version: version}
 	if err := cli.Run(context.Background(), os.Args[1:], env); err != nil {
 		fmt.Fprintln(os.Stderr, "licensebox:", err)
 		os.Exit(1)
