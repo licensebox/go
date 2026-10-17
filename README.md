@@ -28,8 +28,20 @@ if _, err := lic.Require(ctx, "export"); err != nil {
 - `lease`: the lease format, for checking leases without the client.
 - `cmd/signin`: signs in to a product and prints the lease, for trying a
   product's set-up.
+- `admin`: the admin API, for automating what admins do, as granting a
+  module when a payment comes in.
+- `cmd/licensebox`: the admin command: create products, grant modules,
+  revoke users and machines.
 
-Standard library only. The full guide, and the HTTP API for other
-languages, is at [licensebox.dev/docs](https://licensebox.dev/docs).
+```
+go install licensebox.dev/cmd/licensebox@latest
+licensebox login you@example.org
+licensebox create myapp -modules core,export -free core
+licensebox grant myapp ada@example.org export -until 2027-01-31
+```
+
+Standard library only. The developer guide, and the HTTP API for other languages, is at
+[licensebox.dev/docs](https://licensebox.dev/docs); the admin guide at
+[licensebox.dev/docs/admin](https://licensebox.dev/docs/admin).
 
 MIT licence.
