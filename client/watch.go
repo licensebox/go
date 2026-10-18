@@ -54,6 +54,9 @@ func (c *Client) Watch(parent context.Context, module string, options WatchOptio
 	remaining := func(r HeartbeatResult) time.Duration {
 		return r.Lease.Expires.Sub(r.observedAt) - time.Since(r.observedWall)
 	}
+	// Keep one monotonic deadline. Offline results cannot restart its allowance
+	// when the host wall clock moves backward or stops advancing.
+	deadlineAt := initial.observedWall.Add(initial.Lease.Expires.Sub(initial.observedAt))
 	interval := func(r HeartbeatResult) time.Duration {
 		d := options.Interval
 		if d == 0 {
@@ -65,7 +68,7 @@ func (c *Client) Watch(parent context.Context, module string, options WatchOptio
 				d = limit
 			}
 		}
-		left := remaining(r)
+		left := time.Until(deadlineAt)
 		// Renew ahead of expiry; a grant with less than a second remaining is
 		// simply bounded by the independent expiry timer rather than busy-polled.
 		if left > time.Second {
@@ -76,7 +79,7 @@ func (c *Client) Watch(parent context.Context, module string, options WatchOptio
 		return max(d, time.Millisecond)
 	}
 	go func() {
-		deadline := time.NewTimer(max(remaining(initial), 0))
+		deadline := time.NewTimer(max(time.Until(deadlineAt), 0))
 		next := time.NewTimer(interval(initial))
 		defer deadline.Stop()
 		defer next.Stop()
@@ -118,6 +121,12 @@ func (c *Client) Watch(parent context.Context, module string, options WatchOptio
 				if work.Err() != nil {
 					return
 				}
+				// A late result cannot bridge an elapsed authorization deadline,
+				// even when select chooses it before an already-ready timer.
+				if !time.Now().Before(deadlineAt) {
+					cancel(ErrOffline)
+					return
+				}
 				if item.err != nil {
 					cancel(item.err)
 					return
@@ -127,13 +136,16 @@ func (c *Client) Watch(parent context.Context, module string, options WatchOptio
 					cancel(ErrOffline)
 					return
 				}
-				if !deadline.Stop() {
-					select {
-					case <-deadline.C:
-					default:
+				if item.result.Online {
+					deadlineAt = item.result.observedWall.Add(item.result.Lease.Expires.Sub(item.result.observedAt))
+					if !deadline.Stop() {
+						select {
+						case <-deadline.C:
+						default:
+						}
 					}
+					deadline.Reset(max(time.Until(deadlineAt), 0))
 				}
-				deadline.Reset(left)
 				if !next.Stop() {
 					select {
 					case <-next.C:

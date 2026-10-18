@@ -138,3 +138,46 @@ func TestWatchDoesNotActivateMissingIdentity(t *testing.T) {
 		t.Fatal("monitor started sign-in")
 	}
 }
+
+func TestWatchOfflineChecksCannotRestartDeadlineWhenClockStops(t *testing.T) {
+	st, c := signedInWatchClient(t, 1500*time.Millisecond)
+	// The saved clock can stop advancing after the OS wall clock rolls back.
+	// New offline observations must retain the initial monotonic deadline.
+	c.cfg.HTTP = &http.Client{Transport: fixedHTTPResponse{503, `{"error":"unavailable"}`}}
+	began := time.Now()
+	work, stop, err := c.Watch(context.Background(), "core", WatchOptions{Interval: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	select {
+	case <-work.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("offline checks restarted the signed allowance")
+	}
+	if !errors.Is(context.Cause(work), ErrOffline) {
+		t.Fatal(context.Cause(work))
+	}
+	if time.Since(began) > 1900*time.Millisecond {
+		t.Fatal("authorization extended past original deadline")
+	}
+	if _, renewals := st.srv.count(); renewals != 0 {
+		t.Fatal("offline fixture unexpectedly renewed")
+	}
+}
+
+type stalledRefusalBody struct{}
+
+func (stalledRefusalBody) Read([]byte) (int, error) { return 0, context.DeadlineExceeded }
+func (stalledRefusalBody) Close() error             { return nil }
+func TestHeartbeatPreservesRefusalHeadersWhenBodyTimesOut(t *testing.T) {
+	_, c := signedInWatchClient(t, time.Hour)
+	c.cfg.HTTP = &http.Client{Transport: heartbeatTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 403, Status: "403 Forbidden", Header: make(http.Header), Body: stalledRefusalBody{}}, nil
+	})}
+	result, err := c.Heartbeat(context.Background(), "core")
+	var refused *PolicyError
+	if err == nil || result.Online || !errors.As(err, &refused) || refused.Code != "http_error" {
+		t.Fatalf("stalled refusal used offline fallback: %+v %v", result, err)
+	}
+}

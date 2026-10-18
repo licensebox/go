@@ -453,6 +453,10 @@ func (c *Client) post(ctx context.Context, path string, in, out any) error {
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
+		// Refusal headers remain authoritative even when its body stalls.
+		if resp.StatusCode >= 300 && resp.StatusCode < 500 {
+			return &apiError{status: resp.StatusCode, Code: "http_error", Detail: resp.Status}
+		}
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
