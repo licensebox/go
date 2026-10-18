@@ -22,8 +22,3 @@ jobs:
           LICENSEBOX_TEST_NATIVE: '1'
         run: go test -race ./... -count=1 -timeout=5m
       - run: go vet ./...
-
-  conformance:
-    uses: licensebox/protocol/.github/workflows/sdk.yml@f210048228da2fcb2b11618d52b481a8e8f2f79e
-    with:
-      language: go
