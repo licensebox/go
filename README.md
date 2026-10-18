@@ -108,3 +108,43 @@ and by the server on signed device, token and app requests. Raw identifiers
 never leave the host. New keys on the same native machine replace its existing
 seat; deleting keys cannot evade a machine revocation. Native-ID spoofing or
 full VM clones remain possible; this is not hardware attestation.
+
+## Optional heartbeats for long-running work
+
+`Require` checks at command start and does not create a background task. For a
+long-running job, call `lic.Heartbeat(ctx, "export")` at your chosen checkpoints.
+It forces a bounded online renewal, even with a fresh cached lease, and reports
+`result.Online`. Eligible outages can use the last verified lease until its
+signed expiry; refusals never use that fallback. Heartbeat never opens sign-in
+or creates a replacement installation key. Sign in explicitly before starting.
+
+For a cancellable Go task, opt into a monitor:
+
+```go
+work, stop, err := lic.Watch(ctx, "export", client.WatchOptions{})
+if err != nil {
+    return err
+}
+defer stop()
+return runJob(work) // observe cancellation at safe checkpoints
+```
+
+Inspect `context.Cause(work)` for the refusal or expiry reason. The monitor
+signals cancellation; your application owns checkpointing and shutdown. Its
+expiry watchdog runs independently of HTTP requests and optional `OnCheck`
+callbacks. Callbacks must return promptly and must not contain the protected job.
+No app process is killed automatically.
+
+Admins can set a product's maximum check interval and contact grace period:
+
+```sh
+licensebox product myapp -heartbeat-interval 300 -heartbeat-grace 900
+licensebox product myapp -heartbeat-interval 0 # disable policy
+```
+
+The policy is off by default. Enabled intervals are 30–86,400 seconds; grace
+must be at least the interval and no more than 365 days. Every new lease expires
+within the grace period (or an earlier offline/grant limit), including for older
+clients. `Watch` uses the signed interval unless the caller chooses a faster
+one. The policy does not start a monitor in an application that never opts in.
+An offline client discovers a new revocation at contact or signed expiry.

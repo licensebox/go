@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"licensebox.dev/machine"
+	"licensebox.dev/policy"
 )
 
 // Version is the lease format's version.
@@ -44,6 +45,9 @@ type Lease struct {
 	Expires time.Time       `json:"expires"`
 	// Terms is the version of the terms the user accepted.
 	Terms int `json:"terms"`
+	// Heartbeat is optional signed scheduling policy. Expires remains the hard
+	// authorization deadline, including for older clients.
+	Heartbeat *policy.Heartbeat `json:"heartbeat,omitempty"`
 }
 
 // Has reports whether the lease lets its holder run the module.
@@ -67,7 +71,7 @@ const leasePrefix = "licensebox lease v2\n"
 
 // Sign returns the lease signed with key, whose id the lease names.
 func Sign(l Lease, kid string, key ed25519.PrivateKey) (string, error) {
-	if !l.Binding.Valid() {
+	if !l.Binding.Valid() || !validHeartbeat(l) {
 		return "", ErrMalformed
 	}
 	l.V, l.KID = Version, kid
@@ -119,7 +123,7 @@ func Check(token, product string, keys Keys, now time.Time) (Lease, error) {
 	if l.Product != product {
 		return l, fmt.Errorf("%w: for product %q, not %q", ErrMalformed, l.Product, product)
 	}
-	if !l.Binding.Valid() {
+	if !l.Binding.Valid() || !validHeartbeat(l) {
 		return l, ErrMalformed
 	}
 	if !now.Before(l.Expires) {
@@ -187,3 +191,13 @@ func DecodeSignature(s string) ([]byte, error) {
 
 func enc(b []byte) string          { return base64.RawURLEncoding.EncodeToString(b) }
 func dec(s string) ([]byte, error) { return base64.RawURLEncoding.DecodeString(s) }
+
+// A heartbeat policy never extends the ordinary signed lease expiry.
+func validHeartbeat(l Lease) bool {
+	if l.Heartbeat == nil {
+		return true
+	}
+	p := *l.Heartbeat
+	return p.Enabled() && p.Validate() == nil && !l.Issued.IsZero() &&
+		l.Expires.After(l.Issued) && !l.Expires.After(l.Issued.Add(time.Duration(p.GraceSeconds)*time.Second))
+}

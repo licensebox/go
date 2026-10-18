@@ -417,6 +417,8 @@ func settings(fs *flag.FlagSet) func(s *admin.Settings) {
 	trialMods := fs.String("trial", "", "the modules each new user may try")
 	trialDays := fs.Int("trial-days", 0, "how long the trial lasts")
 	leaseHours := fs.Int("lease-hours", 0, "how long apps run offline (24 if 0)")
+	heartbeatInterval := fs.Int("heartbeat-interval", 0, "optional heartbeat interval in seconds; 0 disables")
+	heartbeatGrace := fs.Int("heartbeat-grace", 0, "maximum seconds without successful contact for heartbeat products")
 	machineLimit := fs.Int("machine-limit", 0, "machine seats per user; 0 means unrestricted; new sign-ins transfer the oldest seat")
 	var allowAreas, blockAreas []policy.Area
 	fs.Func("allow-areas", "allowed countries, cities or radii, separated by semicolons", func(text string) error { var err error; allowAreas, err = policy.ParseAreas(text); return err })
@@ -449,6 +451,13 @@ func settings(fs *flag.FlagSet) func(s *admin.Settings) {
 				s.TrialDays = *trialDays
 			case "lease-hours":
 				s.LeaseHours = *leaseHours
+			case "heartbeat-interval":
+				s.Heartbeat.IntervalSeconds = *heartbeatInterval
+				if *heartbeatInterval == 0 {
+					s.Heartbeat.GraceSeconds = 0
+				}
+			case "heartbeat-grace":
+				s.Heartbeat.GraceSeconds = *heartbeatGrace
 			case "machine-limit":
 				s.MachineLimit = *machineLimit
 			case "allow-areas":
@@ -536,6 +545,11 @@ func (r runner) settings(p admin.Product) {
 		if d := p.Descriptions[m]; d != "" {
 			fmt.Fprintf(r.tw, "  %s\t%s\n", m, d)
 		}
+	}
+	if p.Heartbeat.Enabled() {
+		fmt.Fprintf(r.tw, "heartbeat interval\t%ds\ncontact grace\t%ds\n", p.Heartbeat.IntervalSeconds, p.Heartbeat.GraceSeconds)
+	} else {
+		fmt.Fprintln(r.tw, "heartbeat\tdisabled")
 	}
 }
 

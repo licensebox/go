@@ -85,6 +85,8 @@ type Settings struct {
 	// LeaseHours is how long an app runs offline after its last check;
 	// zero means 24.
 	LeaseHours int `json:"lease_hours"`
+	// Heartbeat controls optional long-running application checks; zero disables.
+	Heartbeat policy.Heartbeat `json:"heartbeat"`
 	// MachineLimit is seats per user and product; zero means unrestricted.
 	MachineLimit int              `json:"machine_limit"`
 	Locations    policy.Locations `json:"locations"`

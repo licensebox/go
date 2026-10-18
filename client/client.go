@@ -83,7 +83,8 @@ type Client struct {
 var (
 	// ErrRevoked is returned when the server refuses to renew: the user
 	// or this machine is no longer licensed.
-	ErrRevoked = errors.New("licensebox: the licence was revoked")
+	ErrNotSignedIn = errors.New("licensebox: not signed in; explicitly sign in before starting protected work")
+	ErrRevoked     = errors.New("licensebox: the licence was revoked")
 	// ErrDenied is returned when a sign-in is refused.
 	ErrDenied = errors.New("licensebox: sign-in refused")
 	// ErrSignInExpired is returned when a sign-in is not finished in time.
@@ -381,7 +382,7 @@ func (c *Client) Status() (lease.Lease, error) {
 	}
 	token := c.stored()
 	if token == "" {
-		return lease.Lease{}, errors.New("licensebox: not signed in")
+		return lease.Lease{}, ErrNotSignedIn
 	}
 	l, err := lease.Check(token, c.cfg.Product, c.cfg.Keys, c.now())
 	if err == nil || errors.Is(err, lease.ErrExpired) {
@@ -442,7 +443,10 @@ func (c *Client) post(ctx context.Context, path string, in, out any) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.cfg.HTTP.Do(req)
+	// A redirect must never forward a signed lease/body to another endpoint.
+	httpClient := *c.cfg.HTTP
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -488,6 +492,12 @@ func (c *Client) call(ctx context.Context, kind, token string, payload, out any)
 	if err != nil {
 		return err
 	}
+	return c.callSigned(ctx, kind, token, payload, out, key, binding)
+}
+
+// callSigned uses a previously verified installation key. Heartbeat uses this
+// path so missing/deleted credentials can never create a replacement identity.
+func (c *Client) callSigned(ctx context.Context, kind, token string, payload, out any, key ed25519.PrivateKey, binding machine.Binding) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -509,22 +519,34 @@ func (c *Client) call(ctx context.Context, kind, token string, payload, out any)
 // renew trades the lease for a fresh one, and keeps it, sending the
 // usage counted since the last renewal if the product collects it.
 func (c *Client) renew(ctx context.Context, token string) (lease.Lease, error) {
+	key, err := c.installKey()
+	if err != nil {
+		return lease.Lease{}, err
+	}
+	binding, err := c.binding()
+	if err != nil {
+		return lease.Lease{}, err
+	}
+	return c.renewWithKey(ctx, token, key, binding)
+}
+
+func (c *Client) renewWithKey(ctx context.Context, token string, key ed25519.PrivateKey, binding machine.Binding) (lease.Lease, error) {
 	if token == "" {
-		return lease.Lease{}, errors.New("licensebox: no lease")
+		return lease.Lease{}, ErrNotSignedIn
 	}
 	sent := c.pendingUsage()
 	var resp struct {
 		Lease string `json:"lease"`
 		Usage bool   `json:"usage"`
 	}
-	if err := c.call(ctx, "renew", token, map[string]any{"usage": sent}, &resp); err != nil {
+	if err := c.callSigned(ctx, "renew", token, map[string]any{"usage": sent}, &resp, key, binding); err != nil {
 		return lease.Lease{}, err
 	}
 	l, err := lease.Check(resp.Lease, c.cfg.Product, c.cfg.Keys, c.now())
 	if err != nil {
-		return lease.Lease{}, err
+		return l, err
 	}
-	if !c.own(l) {
+	if l.Binding != binding || l.Machine != lease.EncodeKey(key.Public().(ed25519.PublicKey)) {
 		return lease.Lease{}, errors.New("licensebox: the server sent a lease for another machine")
 	}
 	c.usageSent(sent, resp.Usage)
