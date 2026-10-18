@@ -1,0 +1,46 @@
+name: Sync SDK contract
+on:
+  schedule:
+    - cron: '43 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  discover:
+    if: github.repository_owner == 'licensebox'
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.discover.outputs.ref }}
+      changed: ${{ steps.discover.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: discover
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/discover.py
+  test:
+    needs: discover
+    if: needs.discover.outputs.changed == 'true'
+    uses: licensebox/protocol/.github/workflows/sdk.yml@abb8a6f1ae4c4874b431ce38dc1d53ca3d6ce77d
+    with:
+      language: go
+      protocol_ref: ${{ needs.discover.outputs.ref }}
+  propose:
+    needs: [discover, test]
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tested-protocol-pin
+          path: .
+      - name: Open tested metadata PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/open_sync_pr.py

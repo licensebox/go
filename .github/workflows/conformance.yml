@@ -1,0 +1,12 @@
+name: Test
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  conformance:
+    uses: licensebox/protocol/.github/workflows/sdk.yml@abb8a6f1ae4c4874b431ce38dc1d53ca3d6ce77d
+    with:
+      language: go
