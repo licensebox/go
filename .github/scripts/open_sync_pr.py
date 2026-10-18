@@ -6,16 +6,19 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+from registry import SDK_REPOSITORIES
 
 def run(*args,**kwargs):return subprocess.check_output(args,text=True,**kwargs).strip()
 repo=os.environ["GITHUB_REPOSITORY"]
-if repo not in {"licensebox/go","licensebox/python","licensebox/javascript","licensebox/c","licensebox/cpp"}:
+if repo not in SDK_REPOSITORIES.values():
     raise SystemExit("repository is not in the SDK allowlist")
 lock=json.loads(Path("protocol-lock.json").read_text())
 ref=lock["ref"]
 if not re.fullmatch(r"[0-9a-f]{40}",ref) or lock.get("repository")!="licensebox/protocol":raise SystemExit("invalid contract pin")
 allowed=["protocol-lock.json"]
+if repo=="licensebox/wasm":allowed.append("host-dependencies.txt")
 if repo=="licensebox/cpp":allowed.append("c-version.cmake")
+if Path("native-version.txt").is_file():allowed.append("native-version.txt")
 changed=run("git","diff","--name-only").splitlines()
 if set(changed)-set(allowed):raise SystemExit("unexpected tracked changes in metadata-only sync")
 untracked=run("git","ls-files","--others","--exclude-standard").splitlines()
@@ -34,11 +37,17 @@ run("git","switch","-c",branch)
 run("git","add","--",*allowed)
 run("git","commit","-m",f"Sync Licensebox contract revision {lock['revision']}")
 run("git","push","origin",f"HEAD:refs/heads/{branch}")
-body=(f"Update the pinned Licensebox contract to `{ref}` (revision {lock['revision']}).\n\n"
-      "The Linux SDK and shared behavioral conformance checks passed against this contract before this PR was created. "
+validation=f"https://github.com/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+checks=("Only the native Java bridge build/lifecycle checks passed. Wolfram runtime conformance remains unvalidated; this is a source preview, not a release. "
+        if lock.get("validation_profile")=="bridge-only-unvalidated" else
+        "The Linux SDK and shared behavioral conformance checks passed against this contract before this PR was created. ")
+body=(f"Update the pinned Licensebox contract to `{ref}` (revision {lock['revision']}).\n\n" + checks +
+      f"Validation: {validation}. "
       "Review any required language-specific implementation changes before release. No package publication is performed.\n")
 with tempfile.NamedTemporaryFile(mode="w",suffix=".md") as file:
     file.write(body);file.flush()
     print(run("gh","pr","create","--repo",repo,"--base","main","--head",branch,"--title",f"Sync SDK contract revision {lock['revision']}","--body-file",file.name))
 # Explicit dispatch avoids relying on token-created PR event approval behavior.
 run("gh","workflow","run","test.yml","--repo",repo,"--ref",branch)
+if repo=="licensebox/go":
+    run("gh","workflow","run","conformance.yml","--repo",repo,"--ref",branch)
