@@ -327,14 +327,12 @@ func (c *Client) lease(ctx context.Context) (lease.Lease, bool, error) {
 		return c.signIn(ctx)
 	case errors.Is(err, ErrSeatTransferred) || errors.Is(err, ErrLocationDenied) || errors.Is(err, ErrMachineChanged):
 		return lease.Lease{}, false, err
-	case errors.As(err, &e) && e.status >= 400 && e.status < 500:
+	case errors.As(err, &e) && e.status >= 300 && e.status < 500:
 		return lease.Lease{}, false, err
 	case savedDenial != nil:
 		return lease.Lease{}, false, savedDenial
 	case kerr == nil:
 		return kept, false, nil // offline: the lease kept holds until it expires
-	case errors.As(err, &e):
-		return lease.Lease{}, false, err // as the clock being off
 	default:
 		return lease.Lease{}, false, fmt.Errorf("%w (%v)", ErrOffline, err)
 	}
@@ -456,7 +454,8 @@ func (c *Client) post(ctx context.Context, path string, in, out any) error {
 	if resp.StatusCode != http.StatusOK {
 		e := &apiError{status: resp.StatusCode}
 		if json.Unmarshal(data, e) != nil || e.Code == "" {
-			return fmt.Errorf("licensebox: %s", resp.Status)
+			e.Code, e.Detail = "http_error", resp.Status
+			return e
 		}
 		if e.Code == "revoked" {
 			c.forget()
