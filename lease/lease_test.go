@@ -6,12 +6,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"licensebox.dev/machine"
 )
 
 func TestSignCheck(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(nil)
 	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
-	l := Lease{Product: "edgewise", User: "u_1", Email: "ada@example.org", Modules: []string{"core", "print"}, Issued: now, Expires: now.Add(30 * 24 * time.Hour), Terms: 1}
+	binding, _ := machine.Derive("edgewise", "linux-machine-id", "1234567890abcdef1234567890abcdef")
+	l := Lease{Binding: binding, Product: "edgewise", User: "u_1", Email: "ada@example.org", Modules: []string{"core", "print"}, Issued: now, Expires: now.Add(30 * 24 * time.Hour), Terms: 1}
 	token, err := Sign(l, "k1", priv)
 	if err != nil {
 		t.Fatal(err)

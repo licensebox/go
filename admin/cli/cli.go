@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"licensebox.dev/admin"
+	"licensebox.dev/policy"
 )
 
 const usage = `usage: licensebox [-json] command [arguments]
@@ -37,7 +38,8 @@ Products:
   product ID                          a product's settings, keys and admins
   product ID [settings]               change settings; those not given are kept
       settings: -name, -modules a,b, -free a, -trial b, -trial-days N,
-                -lease-hours N, -terms N, -terms-url URL, -contact EMAIL
+                -lease-hours N, -machine-limit N, -allow-areas AREAS, -block-areas AREAS,
+                -terms N, -terms-url URL, -contact EMAIL
       -describe "module: what it is for" (again for each), -hidden a,
                 -usage on|off (collect counts of the commands apps run)
   key add ID                          a new signing key, current from now
@@ -415,6 +417,10 @@ func settings(fs *flag.FlagSet) func(s *admin.Settings) {
 	trialMods := fs.String("trial", "", "the modules each new user may try")
 	trialDays := fs.Int("trial-days", 0, "how long the trial lasts")
 	leaseHours := fs.Int("lease-hours", 0, "how long apps run offline (24 if 0)")
+	machineLimit := fs.Int("machine-limit", 0, "machine seats per user; 0 means unrestricted; new sign-ins transfer the oldest seat")
+	var allowAreas, blockAreas []policy.Area
+	fs.Func("allow-areas", "allowed countries, cities or radii, separated by semicolons", func(text string) error { var err error; allowAreas, err = policy.ParseAreas(text); return err })
+	fs.Func("block-areas", "blocked countries, cities or radii, separated by semicolons", func(text string) error { var err error; blockAreas, err = policy.ParseAreas(text); return err })
 	terms := fs.Int("terms", 0, "the version of the terms users accept")
 	termsURL := fs.String("terms-url", "", "where the terms are")
 	contact := fs.String("contact", "", "shown where users are refused")
@@ -443,6 +449,12 @@ func settings(fs *flag.FlagSet) func(s *admin.Settings) {
 				s.TrialDays = *trialDays
 			case "lease-hours":
 				s.LeaseHours = *leaseHours
+			case "machine-limit":
+				s.MachineLimit = *machineLimit
+			case "allow-areas":
+				s.Locations.Allow = allowAreas
+			case "block-areas":
+				s.Locations.Block = blockAreas
 			case "terms":
 				s.Terms = *terms
 			case "terms-url":
@@ -477,7 +489,7 @@ func (r runner) create(args []string) error {
 	if err != nil {
 		return err
 	}
-	s := admin.Settings{Terms: 1}
+	s := admin.Settings{Terms: 1, MachineLimit: 1}
 	apply(&s)
 	cr, err := r.c.CreateProduct(r.ctx, pos[0], s)
 	return r.show(cr, err, func() {
@@ -519,6 +531,7 @@ func (r runner) product(args []string) error {
 func (r runner) settings(p admin.Product) {
 	fmt.Fprintf(r.tw, "id\t%s\nname\t%s\nmodules\t%s\nfree\t%s\nhidden\t%s\ntrial\t%s\noffline\t%d hours\nterms\t%s\ncontact\t%s\nusage\t%s\n",
 		p.ID, p.Name, list(p.Modules), list(p.Free), list(p.Hidden), trial(p.Settings), hours(p.LeaseHours), terms(p.Settings), dash(p.Contact), onOff(p.Usage))
+	fmt.Fprintf(r.tw, "machine seats\t%d (0 is unrestricted)\nallowed areas\t%s\nblocked areas\t%s\n", p.MachineLimit, strings.ReplaceAll(policy.FormatAreas(p.Locations.Allow), "\n", "; "), strings.ReplaceAll(policy.FormatAreas(p.Locations.Block), "\n", "; "))
 	for _, m := range p.Modules {
 		if d := p.Descriptions[m]; d != "" {
 			fmt.Fprintf(r.tw, "  %s\t%s\n", m, d)
@@ -605,7 +618,14 @@ func (r runner) user(u admin.User) {
 	fmt.Fprintln(r.env.Out)
 	fmt.Fprintln(r.tw, "MACHINE\tSYSTEM\tVERSION\tLAST CHECK\tSTATE")
 	for _, m := range u.Machines {
-		fmt.Fprintf(r.tw, "%s\t%s/%s\t%s\t%s\t%s\n", m.Key, m.OS, m.Arch, dash(m.Version), m.Last.UTC().Format("2006-01-02 15:04"), state(m.Revoked))
+		seatState := "seat transferred"
+		if m.Allocated {
+			seatState = "allocated"
+		}
+		if m.Revoked {
+			seatState = "revoked"
+		}
+		fmt.Fprintf(r.tw, "%s\t%s/%s\t%s\t%s\t%s\n", m.Key, m.OS, m.Arch, dash(m.Version), m.Last.UTC().Format("2006-01-02 15:04"), seatState)
 	}
 }
 

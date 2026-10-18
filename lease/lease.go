@@ -21,10 +21,12 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"licensebox.dev/machine"
 )
 
 // Version is the lease format's version.
-const Version = 1
+const Version = 2
 
 // Lease is what a lease says.
 type Lease struct {
@@ -34,10 +36,12 @@ type Lease struct {
 	User    string `json:"user"`
 	Email   string `json:"email"`
 	// Machine is the installation's public key, base64url.
-	Machine string    `json:"machine"`
-	Modules []string  `json:"modules"`
-	Issued  time.Time `json:"issued"`
-	Expires time.Time `json:"expires"`
+	Machine string `json:"machine"`
+	// Binding ties the installation key to the native host identity.
+	Binding machine.Binding `json:"binding"`
+	Modules []string        `json:"modules"`
+	Issued  time.Time       `json:"issued"`
+	Expires time.Time       `json:"expires"`
 	// Terms is the version of the terms the user accepted.
 	Terms int `json:"terms"`
 }
@@ -59,10 +63,13 @@ var (
 
 // leasePrefix is signed with the payload, so that no other message
 // signed by a product key is also a lease.
-const leasePrefix = "licensebox lease v1\n"
+const leasePrefix = "licensebox lease v2\n"
 
 // Sign returns the lease signed with key, whose id the lease names.
 func Sign(l Lease, kid string, key ed25519.PrivateKey) (string, error) {
+	if !l.Binding.Valid() {
+		return "", ErrMalformed
+	}
 	l.V, l.KID = Version, kid
 	payload, err := json.Marshal(l)
 	if err != nil {
@@ -112,6 +119,9 @@ func Check(token, product string, keys Keys, now time.Time) (Lease, error) {
 	if l.Product != product {
 		return l, fmt.Errorf("%w: for product %q, not %q", ErrMalformed, l.Product, product)
 	}
+	if !l.Binding.Valid() {
+		return l, ErrMalformed
+	}
 	if !now.Before(l.Expires) {
 		return l, ErrExpired
 	}
@@ -123,19 +133,24 @@ func Check(token, product string, keys Keys, now time.Time) (Lease, error) {
 // the lease, the time, and a hash of the call's payload, so that a call
 // can be neither replayed much later, nor made for another lease, nor
 // given another payload.
-func CallMessage(kind, token string, t time.Time, payload []byte) []byte {
+func CallMessage(kind, token string, binding machine.Binding, t time.Time, payload []byte) []byte {
 	h := sha256.Sum256(payload)
-	return []byte("licensebox " + kind + " v1\n" + strings.TrimSpace(token) + "\n" + t.UTC().Format(time.RFC3339) + "\n" + hex.EncodeToString(h[:]))
+	return []byte("licensebox " + kind + " v2\n" + strings.TrimSpace(token) + "\n" + string(binding) + "\n" + t.UTC().Format(time.RFC3339) + "\n" + hex.EncodeToString(h[:]))
 }
 
 // devicePrefix is signed with a sign-in request, by the installation's
 // key.
-const devicePrefix = "licensebox device v1\n"
+const devicePrefix = "licensebox device v2\n"
 
 // DeviceMessage returns what an installation signs to start a sign-in for
 // a product at time t, proving it holds the key the lease will name.
-func DeviceMessage(product string, t time.Time) []byte {
-	return []byte(devicePrefix + product + "\n" + t.UTC().Format(time.RFC3339))
+func DeviceMessage(product string, binding machine.Binding, t time.Time) []byte {
+	return []byte(devicePrefix + product + "\n" + string(binding) + "\n" + t.UTC().Format(time.RFC3339))
+}
+
+// TokenMessage binds device-flow polling to the initiating key and host.
+func TokenMessage(code string, binding machine.Binding, t time.Time) []byte {
+	return []byte("licensebox token v2\n" + code + "\n" + string(binding) + "\n" + t.UTC().Format(time.RFC3339))
 }
 
 // EncodeKey and DecodeKey write and read a public key as base64url.

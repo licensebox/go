@@ -14,7 +14,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go test ./...
+      - name: Test including native machine identity
+        env:
+          LICENSEBOX_TEST_NATIVE: '1'
+        run: go test ./... -count=1 -timeout=5m
       - name: Build
         env:
           TAG: ${{ github.event.release.tag_name }}

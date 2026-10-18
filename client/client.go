@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"licensebox.dev/lease"
+	"licensebox.dev/machine"
 )
 
 // DefaultServer is the licensebox server.
@@ -45,7 +46,10 @@ type Config struct {
 	// Product is the product's id at the server, and Keys its public
 	// keys, with which its leases are checked.
 	Product string
-	Keys    lease.Keys
+	// MachineBinding supplies a native binding for platform integrations/tests.
+	// The default uses machine.Native(Product); do not supply user-controlled IDs.
+	MachineBinding func() (machine.Binding, error)
+	Keys           lease.Keys
 	// Server is the server's URL; empty means DefaultServer.
 	Server string
 	// Version is the app's version, reported to the server.
@@ -65,7 +69,10 @@ type Config struct {
 
 // Client holds a product's licence on this machine.
 type Client struct {
-	cfg Config
+	cfg         Config
+	bindingOnce sync.Once
+	hostBinding machine.Binding
+	bindingErr  error
 
 	mu sync.Mutex
 	// checked is the lease the server gave this run, if it has.
@@ -135,7 +142,12 @@ func (c *Client) stored() string {
 	return strings.TrimSpace(string(b))
 }
 
-func (c *Client) save(token string) error { return c.write(c.leasePath(), token) }
+func (c *Client) save(token string) error {
+	if err := c.write(c.leasePath(), token); err != nil {
+		return err
+	}
+	return c.clearDenial()
+}
 
 // write replaces a file whole, through a file of its own, so that two
 // runs at once never leave it half written.
@@ -180,9 +192,28 @@ func (c *Client) now() time.Time {
 }
 
 // own reports whether the lease names this installation's key.
-func (c *Client) own(l lease.Lease) bool {
+func (c *Client) ownsKey(l lease.Lease) bool {
 	key, err := c.installKey()
 	return err == nil && l.Machine == lease.EncodeKey(key.Public().(ed25519.PublicKey))
+}
+
+func (c *Client) binding() (machine.Binding, error) {
+	c.bindingOnce.Do(func() {
+		if c.cfg.MachineBinding != nil {
+			c.hostBinding, c.bindingErr = c.cfg.MachineBinding()
+		} else {
+			c.hostBinding, c.bindingErr = machine.Native(c.cfg.Product)
+		}
+		if c.bindingErr == nil && !c.hostBinding.Valid() {
+			c.bindingErr = machine.ErrUnavailable
+		}
+	})
+	return c.hostBinding, c.bindingErr
+}
+
+func (c *Client) own(l lease.Lease) bool {
+	binding, err := c.binding()
+	return err == nil && binding == l.Binding && c.ownsKey(l)
 }
 
 // installKey returns this installation's key, made on first use. Two
@@ -257,8 +288,12 @@ func (c *Client) Lease(ctx context.Context) (lease.Lease, error) {
 func (c *Client) lease(ctx context.Context) (lease.Lease, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	binding, err := c.binding()
+	if err != nil {
+		return lease.Lease{}, false, err
+	}
 	now := c.now()
-	if c.checked != nil && now.Before(c.checked.Expires) {
+	if c.checked != nil && now.Before(c.checked.Expires) && c.denial() == nil {
 		return *c.checked, true, nil
 	}
 	token := c.stored()
@@ -266,12 +301,16 @@ func (c *Client) lease(ctx context.Context) (lease.Lease, bool, error) {
 		return c.signIn(ctx)
 	}
 	kept, kerr := lease.Check(token, c.cfg.Product, c.cfg.Keys, now)
-	if kerr != nil && !errors.Is(kerr, lease.ErrExpired) || !c.own(kept) {
+	if kerr != nil && !errors.Is(kerr, lease.ErrExpired) || !c.ownsKey(kept) {
 		return c.signIn(ctx) // damaged, from another product or key, or copied from another machine
+	}
+	if kept.Binding != binding {
+		return lease.Lease{}, false, ErrMachineChanged
 	}
 	rctx, cancel := context.WithTimeout(ctx, checkTimeout)
 	l, err := c.renew(rctx, token)
 	cancel()
+	savedDenial := c.denial()
 	var e *apiError
 	switch {
 	case err == nil:
@@ -280,12 +319,18 @@ func (c *Client) lease(ctx context.Context) (lease.Lease, bool, error) {
 	case errors.Is(err, ErrRevoked):
 		return lease.Lease{}, false, err
 	case errors.As(err, &e) && (e.Code == "invalid_lease" || e.Code == "terms_changed"):
-		// Expired too long ago, signed by a retired key, or the terms
+		// Signed by a retired key, or the terms
 		// changed and must be accepted again.
 		if e.Code == "terms_changed" {
 			fmt.Fprintln(c.cfg.Out, "The terms of use have changed.")
 		}
 		return c.signIn(ctx)
+	case errors.Is(err, ErrSeatTransferred) || errors.Is(err, ErrLocationDenied) || errors.Is(err, ErrMachineChanged):
+		return lease.Lease{}, false, err
+	case errors.As(err, &e) && e.status >= 400 && e.status < 500:
+		return lease.Lease{}, false, err
+	case savedDenial != nil:
+		return lease.Lease{}, false, savedDenial
 	case kerr == nil:
 		return kept, false, nil // offline: the lease kept holds until it expires
 	case errors.As(err, &e):
@@ -296,7 +341,7 @@ func (c *Client) lease(ctx context.Context) (lease.Lease, bool, error) {
 }
 
 func (c *Client) signIn(ctx context.Context) (lease.Lease, bool, error) {
-	l, err := c.SignIn(ctx)
+	l, err := c.signInFlow(ctx, false)
 	if err != nil {
 		return l, false, err
 	}
@@ -320,7 +365,7 @@ func (c *Client) Require(ctx context.Context, module string) (lease.Lease, error
 			c.checked, l = &nl, nl
 		}
 		c.mu.Unlock()
-		if errors.Is(err, ErrRevoked) {
+		if errors.Is(err, ErrRevoked) || errors.Is(err, ErrSeatTransferred) || errors.Is(err, ErrLocationDenied) || errors.Is(err, ErrMachineChanged) {
 			return lease.Lease{}, err
 		}
 	}
@@ -333,13 +378,22 @@ func (c *Client) Require(ctx context.Context, module string) (lease.Lease, error
 // Status returns the lease kept and whether it is valid now, without
 // signing in or renewing.
 func (c *Client) Status() (lease.Lease, error) {
+	if err := c.denial(); err != nil {
+		return lease.Lease{}, err
+	}
 	token := c.stored()
 	if token == "" {
 		return lease.Lease{}, errors.New("licensebox: not signed in")
 	}
 	l, err := lease.Check(token, c.cfg.Product, c.cfg.Keys, c.now())
-	if err == nil && !c.own(l) {
-		return l, errors.New("licensebox: the lease kept is not this machine's")
+	if err == nil || errors.Is(err, lease.ErrExpired) {
+		binding, berr := c.binding()
+		if berr != nil {
+			return l, berr
+		}
+		if binding != l.Binding || !c.ownsKey(l) {
+			return l, ErrMachineChanged
+		}
 	}
 	return l, err
 }
@@ -354,6 +408,7 @@ func (c *Client) Logout() error {
 // forget removes the lease kept and this run's; c.mu is held.
 func (c *Client) forget() error {
 	c.checked = nil
+	c.clearDenial()
 	os.Remove(c.usagePath())
 	os.Remove(c.usageOnPath())
 	err := os.Remove(c.leasePath())
@@ -365,6 +420,7 @@ func (c *Client) forget() error {
 
 // apiError is the server's error answer.
 type apiError struct {
+	status int
 	Code   string `json:"error"`
 	Detail string `json:"error_description"`
 }
@@ -398,9 +454,16 @@ func (c *Client) post(ctx context.Context, path string, in, out any) error {
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
-		e := &apiError{}
+		e := &apiError{status: resp.StatusCode}
 		if json.Unmarshal(data, e) != nil || e.Code == "" {
 			return fmt.Errorf("licensebox: %s", resp.Status)
+		}
+		if e.Code == "revoked" {
+			c.forget()
+			return ErrRevoked
+		}
+		if e.Code == "seat_transferred" || e.Code == "location_denied" || e.Code == "location_unknown" || e.Code == "machine_changed" {
+			return c.rememberDenial(e)
 		}
 		return e
 	}
@@ -411,6 +474,17 @@ func (c *Client) post(ctx context.Context, path string, in, out any) error {
 // of the lease token: its kind, the lease, the time and the payload, as
 // JSON, are signed together (lease.CallMessage).
 func (c *Client) call(ctx context.Context, kind, token string, payload, out any) error {
+	binding, err := c.binding()
+	if err != nil {
+		return err
+	}
+	kept, _, _, err := lease.Parse(token)
+	if err != nil {
+		return err
+	}
+	if kept.Binding != binding {
+		return ErrMachineChanged
+	}
 	key, err := c.installKey()
 	if err != nil {
 		return err
@@ -421,8 +495,8 @@ func (c *Client) call(ctx context.Context, kind, token string, payload, out any)
 	}
 	t := c.cfg.Now().UTC().Truncate(time.Second)
 	req := map[string]any{
-		"lease": token, "time": t, "version": c.cfg.Version, "payload": string(body),
-		"signature": lease.EncodeSignature(ed25519.Sign(key, lease.CallMessage(kind, token, t, body))),
+		"lease": token, "binding": binding, "time": t, "version": c.cfg.Version, "payload": string(body),
+		"signature": lease.EncodeSignature(ed25519.Sign(key, lease.CallMessage(kind, token, binding, t, body))),
 	}
 	err = c.post(ctx, "/v1/"+kind, req, out)
 	var e *apiError
@@ -461,6 +535,39 @@ func (c *Client) renew(ctx context.Context, token string) (lease.Lease, error) {
 // SignIn signs the user in: it shows a code and a link, opened on any
 // device, and waits for the user to finish there.
 func (c *Client) SignIn(ctx context.Context) (lease.Lease, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	l, err := c.signInFlow(ctx, true)
+	if err == nil {
+		c.checked = &l
+	}
+	return l, err
+}
+
+func (c *Client) rotateKey() error {
+	_, key, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		return err
+	}
+	if err := c.write(c.keyPath(), encodeSeed(key)); err != nil {
+		return err
+	}
+	return c.forget()
+}
+
+func (c *Client) signInFlow(ctx context.Context, explicit bool) (lease.Lease, error) {
+	binding, err := c.binding()
+	if err != nil {
+		return lease.Lease{}, err
+	}
+	if l, _, _, err := lease.Parse(c.stored()); err == nil && l.Binding.Valid() && l.Binding != binding {
+		if !explicit {
+			return lease.Lease{}, ErrMachineChanged
+		}
+		if err := c.rotateKey(); err != nil {
+			return lease.Lease{}, err
+		}
+	}
 	key, err := c.installKey()
 	if err != nil {
 		return lease.Lease{}, err
@@ -476,11 +583,17 @@ func (c *Client) SignIn(ctx context.Context) (lease.Lease, error) {
 	}
 	t := c.cfg.Now().UTC().Truncate(time.Second)
 	req := map[string]any{
-		"product": c.cfg.Product, "machine": lease.EncodeKey(key.Public().(ed25519.PublicKey)),
+		"product": c.cfg.Product, "binding": binding, "machine": lease.EncodeKey(key.Public().(ed25519.PublicKey)),
 		"os": runtime.GOOS, "arch": runtime.GOARCH, "version": c.cfg.Version,
-		"time": t, "signature": lease.EncodeSignature(ed25519.Sign(key, lease.DeviceMessage(c.cfg.Product, t))),
+		"time": t, "signature": lease.EncodeSignature(ed25519.Sign(key, lease.DeviceMessage(c.cfg.Product, binding, t))),
 	}
 	if err := c.post(ctx, "/v1/device", req, &d); err != nil {
+		if explicit && errors.Is(err, ErrMachineChanged) {
+			if err := c.rotateKey(); err != nil {
+				return lease.Lease{}, err
+			}
+			return c.signInFlow(ctx, false)
+		}
 		return lease.Lease{}, err
 	}
 	fmt.Fprintf(c.cfg.Out, "%s needs a one-time sign-in.\nOpen %s and enter the code %s\n", c.cfg.Product, d.VerificationURI, d.UserCode)
@@ -504,7 +617,8 @@ func (c *Client) SignIn(ctx context.Context) (lease.Lease, error) {
 			Lease string `json:"lease"`
 			Usage bool   `json:"usage"`
 		}
-		err := c.post(ctx, "/v1/token", map[string]string{"device_code": d.DeviceCode}, &resp)
+		at := c.cfg.Now().UTC().Truncate(time.Second)
+		err := c.post(ctx, "/v1/token", map[string]any{"device_code": d.DeviceCode, "binding": binding, "time": at, "signature": lease.EncodeSignature(ed25519.Sign(key, lease.TokenMessage(d.DeviceCode, binding, at)))}, &resp)
 		var e *apiError
 		switch {
 		case err == nil:
@@ -522,7 +636,7 @@ func (c *Client) SignIn(ctx context.Context) (lease.Lease, error) {
 			if err := c.save(resp.Lease); err != nil {
 				return lease.Lease{}, err
 			}
-			fmt.Fprintf(c.cfg.Out, "done. Signed in as %s; licence valid until %s.\n", l.Email, l.Expires.Local().Format("2006-01-02"))
+			fmt.Fprintf(c.cfg.Out, "done. Signed in as %s; offline access until %s (renews automatically).\n", l.Email, l.Expires.Local().Format("2006-01-02 15:04 MST"))
 			return l, nil
 		case errors.As(err, &e) && e.Code == "authorization_pending":
 		case errors.As(err, &e) && e.Code == "slow_down":
@@ -530,6 +644,9 @@ func (c *Client) SignIn(ctx context.Context) (lease.Lease, error) {
 		case errors.As(err, &e) && e.Code == "access_denied":
 			fmt.Fprintln(c.cfg.Out)
 			return lease.Lease{}, ErrDenied
+		case errors.Is(err, ErrRevoked) || errors.Is(err, ErrLocationDenied) || errors.Is(err, ErrMachineChanged) || errors.Is(err, ErrSeatTransferred):
+			fmt.Fprintln(c.cfg.Out)
+			return lease.Lease{}, err
 		case errors.As(err, &e) && e.Code == "expired_token":
 			fmt.Fprintln(c.cfg.Out)
 			return lease.Lease{}, ErrSignInExpired

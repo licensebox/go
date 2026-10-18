@@ -82,3 +82,29 @@ Standard library only. The developer guide, and the HTTP API for other languages
 [licensebox.dev/docs/admin](https://licensebox.dev/docs/admin).
 
 MIT licence.
+
+## Machine seats and location policies
+
+Licensebox enforces policies centrally for every product. Set `MachineLimit` and
+`Locations` through the admin API, web console, or CLI (`-machine-limit`,
+`-allow-areas`, `-block-areas`). Zero seats means unrestricted installations.
+A completed sign-in at capacity transfers the oldest seat; renewal cannot take
+it back. New web/CLI-created products default to one seat; products without
+an explicit machine policy migrate to one seat. Explicit zero remains unrestricted. Countries, cities within countries, and radius areas can
+be allowed or blocked. IP location is approximate; blocks take precedence and
+missing required metadata fails closed.
+
+Handle `client.ErrSeatTransferred` and `client.ErrLocationDenied` like other
+authorization failures, before performing work. The SDK persists these refusals
+until renewal or explicit sign-in succeeds and never bypasses them offline.
+An offline machine can keep using a previously issued lease until expiry.
+Expiry requires connectivity, not another email code, even after a long idle
+period. A native machine binding now accompanies the key; see the machine identity guide.
+
+The public integration guide is available at https://licensebox.dev/llms.txt.
+
+Machine binding is enforced by the SDK before both online and offline use,
+and by the server on signed device, token and app requests. Raw identifiers
+never leave the host. New keys on the same native machine replace its existing
+seat; deleting keys cannot evade a machine revocation. Native-ID spoofing or
+full VM clones remain possible; this is not hardware attestation.

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	"licensebox.dev/lease"
+	"licensebox.dev/machine"
 )
 
 // server is a licensebox server for one product and one user, enough to
@@ -38,10 +41,11 @@ type server struct {
 	usageOn  bool
 	usage    map[string]int // runs counted, by command
 	requests [][]string
+	bindings map[string]machine.Binding
 }
 
 func (s *server) issue(machine string) string {
-	l := lease.Lease{Product: "myapp", User: "u_1", Email: "ada@example.org", Machine: machine,
+	l := lease.Lease{Binding: s.bindings[machine], Product: "myapp", User: "u_1", Email: "ada@example.org", Machine: machine,
 		Modules: s.modules, Issued: s.now(), Expires: s.now().Add(s.life), Terms: 1}
 	token, err := lease.Sign(l, "k1", s.key)
 	if err != nil {
@@ -68,10 +72,14 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		t, _ := time.Parse(time.RFC3339, req["time"])
 		key, _ := lease.DecodeKey(req["machine"])
 		sig, _ := lease.DecodeSignature(req["signature"])
-		if key == nil || !ed25519.Verify(key, lease.DeviceMessage(req["product"], t), sig) {
+		if key == nil || !ed25519.Verify(key, lease.DeviceMessage(req["product"], machine.Binding(req["binding"]), t), sig) {
 			fail(http.StatusUnauthorized, "invalid_signature")
 			return
 		}
+		if s.bindings == nil {
+			s.bindings = map[string]machine.Binding{}
+		}
+		s.bindings[req["machine"]] = machine.Binding(req["binding"])
 		s.polls = 0
 		json.NewEncoder(w).Encode(map[string]any{"device_code": "dc:" + req["machine"], "user_code": "WDJB-MJHT",
 			"verification_uri": "https://example.org/activate", "expires_in": 600, "interval_ms": 1})
@@ -92,7 +100,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		key, _ := lease.DecodeKey(l.Machine)
 		sig, _ := lease.DecodeSignature(req["signature"])
 		kind := strings.TrimPrefix(r.URL.Path, "/v1/")
-		if !ed25519.Verify(key, lease.CallMessage(kind, req["lease"], t, []byte(req["payload"])), sig) {
+		if !ed25519.Verify(key, lease.CallMessage(kind, req["lease"], machine.Binding(req["binding"]), t, []byte(req["payload"])), sig) {
 			fail(http.StatusUnauthorized, "invalid_signature")
 			return
 		}
@@ -163,7 +171,7 @@ func newSetup(t *testing.T) setup {
 func (st setup) run(t *testing.T) *Client {
 	c, err := New(Config{
 		Product: "myapp", Keys: lease.Keys{"k1": st.srv.key.Public().(ed25519.PublicKey)},
-		Server: st.url, Dir: st.dir, Out: st.out, Now: func() time.Time { return *st.clock },
+		MachineBinding: func() (machine.Binding, error) { return bindingFor(st.dir), nil }, Server: st.url, Dir: st.dir, Out: st.out, Now: func() time.Time { return *st.clock },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -267,7 +275,7 @@ func TestSignInAgain(t *testing.T) {
 		"damaged lease": func(st setup) { os.WriteFile(filepath.Join(st.dir, "lease"), []byte("garbage\n"), 0o600) },
 		"unknown key": func(st setup) {
 			_, other, _ := ed25519.GenerateKey(nil)
-			token, _ := lease.Sign(lease.Lease{Product: "myapp", Expires: *st.clock}, "k0", other)
+			token, _ := lease.Sign(lease.Lease{Binding: bindingFor(st.dir), Product: "myapp", Expires: *st.clock}, "k0", other)
 			os.WriteFile(filepath.Join(st.dir, "lease"), []byte(token+"\n"), 0o600)
 		},
 		"refused by the server": func(st setup) {
@@ -336,8 +344,11 @@ func TestLeaseFromAnotherMachine(t *testing.T) {
 	if _, err := b.run(t).Status(); err == nil {
 		t.Error("Status accepted a lease copied from another machine")
 	}
-	if l, err := b.run(t).Lease(ctx); err != nil || !b.run(t).own(l) {
-		t.Errorf("a copied lease: %v", err)
+	if _, err := b.run(t).Lease(ctx); !errors.Is(err, ErrMachineChanged) {
+		t.Fatalf("copied lease should require explicit activation: %v", err)
+	}
+	if l, err := b.run(t).SignIn(ctx); err != nil || !b.run(t).own(l) {
+		t.Errorf("explicit activation: %v", err)
 	}
 	if s, _ := a.srv.count(); s != 3 {
 		t.Errorf("%d sign-ins, want 3: the copied lease is replaced by signing in", s)
@@ -432,4 +443,13 @@ func TestAccess(t *testing.T) {
 	if len(st.srv.requests) != 1 {
 		t.Errorf("requests at the server %v", st.srv.requests)
 	}
+}
+
+func bindingFor(host string) machine.Binding {
+	sum := sha256.Sum256([]byte(host))
+	b, err := machine.Derive("myapp", "linux-machine-id", hex.EncodeToString(sum[:16]))
+	if err != nil {
+		panic(err)
+	}
+	return b
 }

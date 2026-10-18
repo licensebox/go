@@ -23,6 +23,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"licensebox.dev/machine"
+	"licensebox.dev/policy"
 )
 
 // DefaultServer is the licensebox server.
@@ -82,6 +85,9 @@ type Settings struct {
 	// LeaseHours is how long an app runs offline after its last check;
 	// zero means 24.
 	LeaseHours int `json:"lease_hours"`
+	// MachineLimit is seats per user and product; zero means unrestricted.
+	MachineLimit int              `json:"machine_limit"`
+	Locations    policy.Locations `json:"locations"`
 	// Terms is the version of the terms users accept, at TermsURL.
 	Terms    int    `json:"terms"`
 	TermsURL string `json:"terms_url"`
@@ -172,13 +178,15 @@ type User struct {
 
 // Machine is an installation.
 type Machine struct {
-	Key     string    `json:"key"`
-	OS      string    `json:"os"`
-	Arch    string    `json:"arch"`
-	Version string    `json:"version"`
-	First   time.Time `json:"first"`
-	Last    time.Time `json:"last"`
-	Revoked bool      `json:"revoked"`
+	Binding   machine.Binding `json:"binding"`
+	Key       string          `json:"key"`
+	OS        string          `json:"os"`
+	Arch      string          `json:"arch"`
+	Version   string          `json:"version"`
+	First     time.Time       `json:"first"`
+	Last      time.Time       `json:"last"`
+	Revoked   bool            `json:"revoked"`
+	Allocated bool            `json:"allocated"`
 }
 
 // Grant lets a user run a module until a time, or always where Until is
