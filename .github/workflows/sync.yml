@@ -23,7 +23,7 @@ jobs:
   test:
     needs: discover
     if: needs.discover.outputs.changed == 'true'
-    uses: licensebox/protocol/.github/workflows/sdk.yml@9ce11055a4bc198155d21ab693e7252782e64b26
+    uses: licensebox/protocol/.github/workflows/sdk.yml@e45a2160a0ebf7277c06bd51369d00a02232a4ad
     with:
       language: go
       protocol_ref: ${{ needs.discover.outputs.ref }}
