@@ -16,8 +16,6 @@ package client
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -195,7 +193,7 @@ func (c *Client) now() time.Time {
 // own reports whether the lease names this installation's key.
 func (c *Client) ownsKey(l lease.Lease) bool {
 	key, err := c.installKey()
-	return err == nil && l.Machine == lease.EncodeKey(key.Public().(ed25519.PublicKey))
+	return err == nil && l.Machine == key.Public().String()
 }
 
 func (c *Client) binding() (machine.Binding, error) {
@@ -221,7 +219,7 @@ func (c *Client) own(l lease.Lease) bool {
 // runs making it at once agree on one: the key file is created only if
 // it is not there, and a run that finds another's still being written
 // waits for it.
-func (c *Client) installKey() (ed25519.PrivateKey, error) {
+func (c *Client) installKey() (*lease.PrivateKey, error) {
 	for range 40 {
 		b, err := os.ReadFile(c.keyPath())
 		if err == nil {
@@ -237,7 +235,7 @@ func (c *Client) installKey() (ed25519.PrivateKey, error) {
 		if !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
-		_, key, err := ed25519.GenerateKey(nil)
+		key, err := lease.GenerateKey()
 		if err != nil {
 			return nil, err
 		}
@@ -264,15 +262,9 @@ func (c *Client) installKey() (ed25519.PrivateKey, error) {
 	return nil, fmt.Errorf("licensebox: %s is damaged; remove it to sign in again", c.keyPath())
 }
 
-func encodeSeed(k ed25519.PrivateKey) string { return base64.RawURLEncoding.EncodeToString(k.Seed()) }
+func encodeSeed(k *lease.PrivateKey) string { return lease.EncodePrivateKey(k) }
 
-func decodeSeed(s string) (ed25519.PrivateKey, error) {
-	b, err := base64.RawURLEncoding.DecodeString(s)
-	if err != nil || len(b) != ed25519.SeedSize {
-		return nil, errors.New("malformed key")
-	}
-	return ed25519.NewKeyFromSeed(b), nil
-}
+func decodeSeed(s string) (*lease.PrivateKey, error) { return lease.DecodePrivateKey(s) }
 
 // Lease returns a valid lease. The first call in a run renews the lease
 // kept with the server, so that every run sees grants and revocations as
@@ -501,15 +493,19 @@ func (c *Client) call(ctx context.Context, kind, token string, payload, out any)
 
 // callSigned uses a previously verified installation key. Heartbeat uses this
 // path so missing/deleted credentials can never create a replacement identity.
-func (c *Client) callSigned(ctx context.Context, kind, token string, payload, out any, key ed25519.PrivateKey, binding machine.Binding) error {
+func (c *Client) callSigned(ctx context.Context, kind, token string, payload, out any, key *lease.PrivateKey, binding machine.Binding) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 	t := c.cfg.Now().UTC().Truncate(time.Second)
+	sig, err := key.Sign(lease.CallMessage(lease.Hybrid, kind, token, binding, t, body))
+	if err != nil {
+		return err
+	}
 	req := map[string]any{
 		"lease": token, "binding": binding, "time": t, "version": c.cfg.Version, "payload": string(body),
-		"signature": lease.EncodeSignature(ed25519.Sign(key, lease.CallMessage(kind, token, binding, t, body))),
+		"signature": lease.EncodeSignature(sig),
 	}
 	err = c.post(ctx, "/v1/"+kind, req, out)
 	var e *apiError
@@ -534,7 +530,7 @@ func (c *Client) renew(ctx context.Context, token string) (lease.Lease, error) {
 	return c.renewWithKey(ctx, token, key, binding)
 }
 
-func (c *Client) renewWithKey(ctx context.Context, token string, key ed25519.PrivateKey, binding machine.Binding) (lease.Lease, error) {
+func (c *Client) renewWithKey(ctx context.Context, token string, key *lease.PrivateKey, binding machine.Binding) (lease.Lease, error) {
 	if token == "" {
 		return lease.Lease{}, ErrNotSignedIn
 	}
@@ -550,7 +546,7 @@ func (c *Client) renewWithKey(ctx context.Context, token string, key ed25519.Pri
 	if err != nil {
 		return l, err
 	}
-	if l.Binding != binding || l.Machine != lease.EncodeKey(key.Public().(ed25519.PublicKey)) {
+	if l.Binding != binding || l.Machine != key.Public().String() {
 		return lease.Lease{}, errors.New("licensebox: the server sent a lease for another machine")
 	}
 	c.usageSent(sent, resp.Usage)
@@ -570,7 +566,7 @@ func (c *Client) SignIn(ctx context.Context) (lease.Lease, error) {
 }
 
 func (c *Client) rotateKey() error {
-	_, key, err := ed25519.GenerateKey(nil)
+	key, err := lease.GenerateKey()
 	if err != nil {
 		return err
 	}
@@ -607,10 +603,14 @@ func (c *Client) signInFlow(ctx context.Context, explicit bool) (lease.Lease, er
 		IntervalMS              int64  `json:"interval_ms"`
 	}
 	t := c.cfg.Now().UTC().Truncate(time.Second)
+	sig, err := key.Sign(lease.DeviceMessage(lease.Hybrid, c.cfg.Product, binding, t))
+	if err != nil {
+		return lease.Lease{}, err
+	}
 	req := map[string]any{
-		"product": c.cfg.Product, "binding": binding, "machine": lease.EncodeKey(key.Public().(ed25519.PublicKey)),
+		"product": c.cfg.Product, "binding": binding, "machine": key.Public().String(),
 		"os": runtime.GOOS, "arch": runtime.GOARCH, "version": c.cfg.Version,
-		"time": t, "signature": lease.EncodeSignature(ed25519.Sign(key, lease.DeviceMessage(c.cfg.Product, binding, t))),
+		"time": t, "signature": lease.EncodeSignature(sig),
 	}
 	if err := c.post(ctx, "/v1/device", req, &d); err != nil {
 		if explicit && errors.Is(err, ErrMachineChanged) {
@@ -643,7 +643,11 @@ func (c *Client) signInFlow(ctx context.Context, explicit bool) (lease.Lease, er
 			Usage bool   `json:"usage"`
 		}
 		at := c.cfg.Now().UTC().Truncate(time.Second)
-		err := c.post(ctx, "/v1/token", map[string]any{"device_code": d.DeviceCode, "binding": binding, "time": at, "signature": lease.EncodeSignature(ed25519.Sign(key, lease.TokenMessage(d.DeviceCode, binding, at)))}, &resp)
+		sig, err := key.Sign(lease.TokenMessage(lease.Hybrid, d.DeviceCode, binding, at))
+		if err != nil {
+			return lease.Lease{}, err
+		}
+		err = c.post(ctx, "/v1/token", map[string]any{"device_code": d.DeviceCode, "binding": binding, "time": at, "signature": lease.EncodeSignature(sig)}, &resp)
 		var e *apiError
 		switch {
 		case err == nil:

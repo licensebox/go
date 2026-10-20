@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"net/url"
@@ -57,7 +56,7 @@ func (c *Client) Heartbeat(ctx context.Context, module string) (HeartbeatResult,
 	if err != nil {
 		return HeartbeatResult{}, err
 	}
-	if kept.Machine != lease.EncodeKey(key.Public().(ed25519.PublicKey)) {
+	if kept.Machine != key.Public().String() {
 		return HeartbeatResult{}, ErrMachineChanged
 	}
 	binding, err := c.binding()

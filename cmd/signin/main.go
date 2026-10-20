@@ -22,14 +22,14 @@ import (
 
 func main() {
 	product := flag.String("product", "", "the product's id")
-	key := flag.String("key", "", "its public key, as kid=base64url")
+	key := flag.String("key", "", "its public key, as kid=ed25519-mldsa65:base64url")
 	server := flag.String("server", client.DefaultServer, "the server")
 	module := flag.String("require", "", "a module to require after signing in")
 	logout := flag.Bool("logout", false, "remove the lease first, to sign in again")
 	flag.Parse()
 	kid, pub, ok := strings.Cut(*key, "=")
 	if *product == "" || !ok {
-		log.Fatal("signin: -product and -key kid=base64url are required")
+		log.Fatal("signin: -product and -key kid=ed25519-mldsa65:base64url are required")
 	}
 	pk, err := lease.DecodeKey(pub)
 	if err != nil {

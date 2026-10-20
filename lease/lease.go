@@ -3,15 +3,15 @@
 // modules it names until it expires.
 //
 // A lease is encoded as base64url(payload) "." base64url(signature): the
-// payload JSON, and an Ed25519 signature over a fixed prefix and the
-// payload. Each product signs with its own keys, named in the lease by
-// kid, so an app carrying the public keys can check a lease but not forge
-// or edit one, and a new key can be added before the old one is retired.
+// payload JSON, and a signature over a fixed prefix, the key's algorithm
+// and the payload. Each product signs with its own keys, named in the
+// lease by kid, so an app carrying the public keys can check a lease but
+// not forge or edit one, and a new key can be added before the old one is
+// retired. Keys are Hybrid: Ed25519 and ML-DSA-65 together.
 package lease
 
 import (
 	"bytes"
-	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -27,7 +27,7 @@ import (
 )
 
 // Version is the lease format's version.
-const Version = 2
+const Version = 3
 
 // Lease is what a lease says.
 type Lease struct {
@@ -36,7 +36,7 @@ type Lease struct {
 	Product string `json:"product"`
 	User    string `json:"user"`
 	Email   string `json:"email"`
-	// Machine is the installation's public key, base64url.
+	// Machine is the installation's public key, "<alg>:<base64url>".
 	Machine string `json:"machine"`
 	// Binding ties the installation key to the native host identity.
 	Binding machine.Binding `json:"binding"`
@@ -54,7 +54,7 @@ type Lease struct {
 func (l Lease) Has(module string) bool { return slices.Contains(l.Modules, module) }
 
 // Keys are a product's public keys, by key id.
-type Keys map[string]ed25519.PublicKey
+type Keys map[string]PublicKey
 
 // Errors that Check returns.
 var (
@@ -65,12 +65,15 @@ var (
 	ErrVersion      = errors.New("lease: unknown version")
 )
 
-// leasePrefix is signed with the payload, so that no other message
-// signed by a product key is also a lease.
-const leasePrefix = "licensebox lease v2\n"
+// leaseMessage is what a product key signs for a lease: a prefix, so
+// that no other message signed by a product key is also a lease, the
+// key's algorithm, and the payload.
+func leaseMessage(alg string, payload []byte) []byte {
+	return append([]byte("licensebox lease v3\n"+alg+"\n"), payload...)
+}
 
 // Sign returns the lease signed with key, whose id the lease names.
-func Sign(l Lease, kid string, key ed25519.PrivateKey) (string, error) {
+func Sign(l Lease, kid string, key Signer) (string, error) {
 	if !l.Binding.Valid() || !validHeartbeat(l) {
 		return "", ErrMalformed
 	}
@@ -79,7 +82,10 @@ func Sign(l Lease, kid string, key ed25519.PrivateKey) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	sig := ed25519.Sign(key, append([]byte(leasePrefix), payload...))
+	sig, err := key.Sign(leaseMessage(key.Public().Algorithm(), payload))
+	if err != nil {
+		return "", err
+	}
 	return enc(payload) + "." + enc(sig), nil
 }
 
@@ -92,7 +98,7 @@ func Parse(token string) (Lease, []byte, []byte, error) {
 	}
 	payload, err1 := dec(a)
 	sig, err2 := dec(b)
-	if err1 != nil || err2 != nil || len(sig) != ed25519.SignatureSize {
+	if err1 != nil || err2 != nil || len(sig) == 0 {
 		return Lease{}, nil, nil, ErrMalformed
 	}
 	var l Lease
@@ -117,7 +123,7 @@ func Check(token, product string, keys Keys, now time.Time) (Lease, error) {
 	if !ok {
 		return l, ErrUnknownKey
 	}
-	if !ed25519.Verify(key, append([]byte(leasePrefix), payload...), sig) {
+	if !key.Verify(leaseMessage(key.Algorithm(), payload), sig) {
 		return l, ErrBadSignature
 	}
 	if l.Product != product {
@@ -132,58 +138,39 @@ func Check(token, product string, keys Keys, now time.Time) (Lease, error) {
 	return l, nil
 }
 
+// The messages below are what an installation signs, with the
+// algorithm of its key, alg. Each starts with its own prefix, so that no
+// message is also another kind, and then names alg, so that a signature
+// is never checked under another algorithm than it was made with.
+
 // CallMessage returns what an installation signs to call the server
 // with its lease at time t: the kind of call (as "renew" or "request"),
 // the lease, the time, and a hash of the call's payload, so that a call
 // can be neither replayed much later, nor made for another lease, nor
 // given another payload.
-func CallMessage(kind, token string, binding machine.Binding, t time.Time, payload []byte) []byte {
+func CallMessage(alg, kind, token string, binding machine.Binding, t time.Time, payload []byte) []byte {
 	h := sha256.Sum256(payload)
-	return []byte("licensebox " + kind + " v2\n" + strings.TrimSpace(token) + "\n" + string(binding) + "\n" + t.UTC().Format(time.RFC3339) + "\n" + hex.EncodeToString(h[:]))
+	return []byte("licensebox " + kind + " v3\n" + alg + "\n" + strings.TrimSpace(token) + "\n" + string(binding) + "\n" + t.UTC().Format(time.RFC3339) + "\n" + hex.EncodeToString(h[:]))
 }
-
-// devicePrefix is signed with a sign-in request, by the installation's
-// key.
-const devicePrefix = "licensebox device v2\n"
 
 // DeviceMessage returns what an installation signs to start a sign-in for
 // a product at time t, proving it holds the key the lease will name.
-func DeviceMessage(product string, binding machine.Binding, t time.Time) []byte {
-	return []byte(devicePrefix + product + "\n" + string(binding) + "\n" + t.UTC().Format(time.RFC3339))
+func DeviceMessage(alg, product string, binding machine.Binding, t time.Time) []byte {
+	return []byte("licensebox device v3\n" + alg + "\n" + product + "\n" + string(binding) + "\n" + t.UTC().Format(time.RFC3339))
 }
 
 // TokenMessage binds device-flow polling to the initiating key and host.
-func TokenMessage(code string, binding machine.Binding, t time.Time) []byte {
-	return []byte("licensebox token v2\n" + code + "\n" + string(binding) + "\n" + t.UTC().Format(time.RFC3339))
+func TokenMessage(alg, code string, binding machine.Binding, t time.Time) []byte {
+	return []byte("licensebox token v3\n" + alg + "\n" + code + "\n" + string(binding) + "\n" + t.UTC().Format(time.RFC3339))
 }
 
-// EncodeKey and DecodeKey write and read a public key as base64url.
-func EncodeKey(k ed25519.PublicKey) string { return enc(k) }
-
-func DecodeKey(s string) (ed25519.PublicKey, error) {
-	b, err := dec(s)
-	if err != nil || len(b) != ed25519.PublicKeySize {
-		return nil, ErrMalformed
-	}
-	return ed25519.PublicKey(b), nil
-}
-
-// MustKey returns the public key written as base64url, as an app builds
-// its product's keys in; it panics on a malformed key.
-func MustKey(s string) ed25519.PublicKey {
-	k, err := DecodeKey(s)
-	if err != nil {
-		panic("lease: malformed public key " + s)
-	}
-	return k
-}
-
-// EncodeSignature and DecodeSignature write and read a signature.
+// EncodeSignature and DecodeSignature write and read a signature. Its
+// length is checked by the key that verifies it.
 func EncodeSignature(s []byte) string { return enc(s) }
 
 func DecodeSignature(s string) ([]byte, error) {
 	b, err := dec(s)
-	if err != nil || len(b) != ed25519.SignatureSize {
+	if err != nil || len(b) == 0 {
 		return nil, ErrMalformed
 	}
 	return b, nil

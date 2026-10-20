@@ -3,7 +3,6 @@ package client
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -27,7 +26,7 @@ import (
 // made unreachable.
 type server struct {
 	t   *testing.T
-	key ed25519.PrivateKey
+	key *lease.PrivateKey
 	now func() time.Time
 
 	mu       sync.Mutex
@@ -72,7 +71,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		t, _ := time.Parse(time.RFC3339, req["time"])
 		key, _ := lease.DecodeKey(req["machine"])
 		sig, _ := lease.DecodeSignature(req["signature"])
-		if key == nil || !ed25519.Verify(key, lease.DeviceMessage(req["product"], machine.Binding(req["binding"]), t), sig) {
+		if !key.Verify(lease.DeviceMessage(key.Algorithm(), req["product"], machine.Binding(req["binding"]), t), sig) {
 			fail(http.StatusUnauthorized, "invalid_signature")
 			return
 		}
@@ -91,7 +90,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.signIns++
 		json.NewEncoder(w).Encode(map[string]any{"lease": s.issue(strings.TrimPrefix(req["device_code"], "dc:")), "usage": s.usageOn})
 	case "/v1/renew", "/v1/modules", "/v1/request":
-		l, err := lease.Check(req["lease"], "myapp", lease.Keys{"k1": s.key.Public().(ed25519.PublicKey)}, time.Time{})
+		l, err := lease.Check(req["lease"], "myapp", lease.Keys{"k1": s.key.Public()}, time.Time{})
 		if err != nil && !errors.Is(err, lease.ErrExpired) {
 			fail(http.StatusBadRequest, "invalid_lease")
 			return
@@ -100,7 +99,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		key, _ := lease.DecodeKey(l.Machine)
 		sig, _ := lease.DecodeSignature(req["signature"])
 		kind := strings.TrimPrefix(r.URL.Path, "/v1/")
-		if !ed25519.Verify(key, lease.CallMessage(kind, req["lease"], machine.Binding(req["binding"]), t, []byte(req["payload"])), sig) {
+		if !key.Verify(lease.CallMessage(key.Algorithm(), kind, req["lease"], machine.Binding(req["binding"]), t, []byte(req["payload"])), sig) {
 			fail(http.StatusUnauthorized, "invalid_signature")
 			return
 		}
@@ -157,7 +156,7 @@ type setup struct {
 }
 
 func newSetup(t *testing.T) setup {
-	_, key, _ := ed25519.GenerateKey(nil)
+	key := mustKey(t)
 	clock := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
 	st := setup{dir: t.TempDir(), clock: &clock, out: &bytes.Buffer{}}
 	st.srv = &server{t: t, key: key, now: func() time.Time { return *st.clock }, modules: []string{"core"}, life: 24 * time.Hour}
@@ -170,7 +169,7 @@ func newSetup(t *testing.T) setup {
 // run is a run of the app: a new client over the same folder.
 func (st setup) run(t *testing.T) *Client {
 	c, err := New(Config{
-		Product: "myapp", Keys: lease.Keys{"k1": st.srv.key.Public().(ed25519.PublicKey)},
+		Product: "myapp", Keys: lease.Keys{"k1": st.srv.key.Public()},
 		MachineBinding: func() (machine.Binding, error) { return bindingFor(st.dir), nil }, Server: st.url, Dir: st.dir, Out: st.out, Now: func() time.Time { return *st.clock },
 	})
 	if err != nil {
@@ -274,8 +273,7 @@ func TestSignInAgain(t *testing.T) {
 	for name, damage := range map[string]func(st setup){
 		"damaged lease": func(st setup) { os.WriteFile(filepath.Join(st.dir, "lease"), []byte("garbage\n"), 0o600) },
 		"unknown key": func(st setup) {
-			_, other, _ := ed25519.GenerateKey(nil)
-			token, _ := lease.Sign(lease.Lease{Binding: bindingFor(st.dir), Product: "myapp", Expires: *st.clock}, "k0", other)
+			token, _ := lease.Sign(lease.Lease{Binding: bindingFor(st.dir), Product: "myapp", Expires: *st.clock}, "k0", mustKey(t))
 			os.WriteFile(filepath.Join(st.dir, "lease"), []byte(token+"\n"), 0o600)
 		},
 		"refused by the server": func(st setup) {
@@ -291,7 +289,7 @@ func TestSignInAgain(t *testing.T) {
 			c := st.run(t)
 			if name == "refused by the server" {
 				// The client must trust the server's new key for the new lease.
-				c.cfg.Keys["k1"] = st.srv.key.Public().(ed25519.PublicKey)
+				c.cfg.Keys["k1"] = st.srv.key.Public()
 			}
 			if _, err := c.Lease(ctx); err != nil {
 				t.Fatal(err)
@@ -303,8 +301,8 @@ func TestSignInAgain(t *testing.T) {
 	}
 }
 
-func mustKey(t *testing.T) ed25519.PrivateKey {
-	_, k, err := ed25519.GenerateKey(nil)
+func mustKey(t *testing.T) *lease.PrivateKey {
+	k, err := lease.GenerateKey()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +366,7 @@ func TestOneInstallKey(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			keys <- lease.EncodeKey(k.Public().(ed25519.PublicKey))
+			keys <- k.Public().String()
 		}()
 	}
 	wg.Wait()

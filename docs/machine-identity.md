@@ -1,8 +1,8 @@
 # Machine identity
 
 Licensebox checks two independent pieces of software state: the installation's
-Ed25519 private key and a product-specific binding derived from native host
-identity. The binding is included in the server-signed v2 lease and in signed
+hybrid Ed25519 + ML-DSA-65 private key and a product-specific binding derived
+from native host identity. The binding is included in the server-signed v3 lease and in signed
 activation, token-polling and app-call proofs. The SDK compares it with the
 current host before using a cached lease, including offline.
 
@@ -42,7 +42,7 @@ digest = HMAC_SHA256(key, UTF8(source + "\n" + canonical_identifier))
 binding = "m1:" + source + ":" + lowercase_hex(digest)
 ```
 
-The binding format is m1; leases and signed request proofs are v2. Source and
+The binding format is m1; leases and signed request proofs are v3. Source and
 OS changes can produce a different identity, including a dual-boot OS with a
 different native source. A system reinstall that resets machine-id can also
 require activation. Ordinary app reinstalls preserve the native identifier.
@@ -63,9 +63,9 @@ require activation. Ordinary app reinstalls preserve the native identifier.
   activity updates cannot clear an administrative revocation through stale
   read/modify/write state.
 
-Protocol v2 is a breaking change. V1 clients and leases do not support these
-proofs. Updating requires one activation to issue a bound v2 lease. Already
-issued v1 leases can remain usable in old binaries until their offline expiry.
+Protocol v3 is a breaking change. It replaces every Ed25519 key and signature
+with the hybrid Ed25519 + ML-DSA-65 one; v2 clients, keys and leases are
+refused. Updating requires new product keys and one activation per machine.
 
 ## Security boundary
 

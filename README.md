@@ -18,9 +18,13 @@ go get licensebox.dev/client
 ```
 
 ```go
+// The product's public key, as `licensebox config myapp` prints it. It is
+// about 2.7 KB, so keep it in its own file (keys.go) or embed it.
+const myappKey = "ed25519-mldsa65:K3T9…"
+
 lic, err := client.New(client.Config{
 	Product: "myapp",
-	Keys:    lease.Keys{"myapp-2026a": lease.MustKey("K3T9…")},
+	Keys:    lease.Keys{"myapp-2026a": lease.MustKey(myappKey)},
 	Version: version,
 })
 if err != nil {
@@ -77,7 +81,15 @@ the next run and safe to retry; signing out discards the queue.
 Version 0.5 changes signed app calls to include the operation and payload
 hash. Upgrade client and server together; see the HTTP guide for the envelope.
 
-Standard library only. The developer guide, and the HTTP API for other languages, is at
+Version 0.8 speaks protocol v3: every signature, by the product's keys and by
+the installation's key, is Ed25519 and ML-DSA-65 (FIPS 204) together, and both
+must verify, so a quantum computer that breaks Ed25519 cannot forge a lease.
+Keys are written `ed25519-mldsa65:<base64url>`. It is a clean break: v2 keys,
+leases and installation keys are refused, and every product gets new keys.
+
+Standard library only (`crypto/mldsa`, Go 1.26 or later). `crypto/mldsa` is
+not available under the FIPS 140-3 Go Cryptographic Module v1.0.0; with that
+module selected, key generation and verification fail. The developer guide, and the HTTP API for other languages, is at
 [licensebox.dev/docs](https://licensebox.dev/docs); the admin guide at
 [licensebox.dev/docs/admin](https://licensebox.dev/docs/admin).
 
