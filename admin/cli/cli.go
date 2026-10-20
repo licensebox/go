@@ -53,8 +53,8 @@ Users:
   grant ID EMAIL MODULE... [-until 2027-01-31 | -days N] [-note text]
   ungrant ID EMAIL MODULE...
   revoke ID EMAIL [-note text]        refuse the user's apps from their next check
-  revoke ID -machine KEY              refuse one machine
-  restore ID EMAIL | -machine KEY
+  revoke ID -machine MACHINE          refuse one machine, by its id from 'user'
+  restore ID EMAIL | -machine MACHINE
   requests ID [-all]                  requests for modules, waiting or all
   approve ID REQUEST [MODULE...]      grant what was asked, or the modules given
                                       [-until 2027-01-31 | -days N] [-note text]
@@ -639,7 +639,7 @@ func (r runner) user(u admin.User) {
 		if m.Revoked {
 			seatState = "revoked"
 		}
-		fmt.Fprintf(r.tw, "%s\t%s/%s\t%s\t%s\t%s\n", m.Key, m.OS, m.Arch, dash(m.Version), m.Last.UTC().Format("2006-01-02 15:04"), seatState)
+		fmt.Fprintf(r.tw, "%s\t%s/%s\t%s\t%s\t%s\n", m.ID, m.OS, m.Arch, dash(m.Version), m.Last.UTC().Format("2006-01-02 15:04"), seatState)
 	}
 }
 
@@ -684,9 +684,9 @@ func (r runner) grant(cmd string, args []string) error {
 
 func (r runner) revoke(cmd string, args []string) error {
 	fs := flags(cmd)
-	machine := fs.String("machine", "", "a machine's key, instead of a user")
+	machine := fs.String("machine", "", "a machine's id, as 'licensebox user' shows it, instead of a user")
 	note := fs.String("note", "", "why, for the record")
-	use := cmd + " ID EMAIL | " + cmd + " ID -machine KEY"
+	use := cmd + " ID EMAIL | " + cmd + " ID -machine MACHINE"
 	pos, err := parse(fs, args, -1, use)
 	if err != nil {
 		return err

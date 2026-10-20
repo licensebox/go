@@ -180,6 +180,8 @@ type User struct {
 
 // Machine is an installation.
 type Machine struct {
+	// ID is lease.MachineID(Key): the short id to revoke or restore it by.
+	ID        string          `json:"id"`
 	Binding   machine.Binding `json:"binding"`
 	Key       string          `json:"key"`
 	OS        string          `json:"os"`
@@ -424,13 +426,14 @@ func (c *Client) Restore(ctx context.Context, product, email string) error {
 	return c.do(ctx, "POST", p("products", product, "restore"), map[string]string{"email": email}, nil)
 }
 
-// RevokeMachine refuses one installation; RestoreMachine undoes it.
-func (c *Client) RevokeMachine(ctx context.Context, product, key, note string) error {
-	return c.do(ctx, "POST", p("products", product, "revoke"), map[string]string{"machine": key, "note": note}, nil)
+// RevokeMachine refuses one installation, named by its ID or its key;
+// RestoreMachine undoes it.
+func (c *Client) RevokeMachine(ctx context.Context, product, machine, note string) error {
+	return c.do(ctx, "POST", p("products", product, "revoke"), map[string]string{"machine": machine, "note": note}, nil)
 }
 
-func (c *Client) RestoreMachine(ctx context.Context, product, key string) error {
-	return c.do(ctx, "POST", p("products", product, "restore"), map[string]string{"machine": key}, nil)
+func (c *Client) RestoreMachine(ctx context.Context, product, machine string) error {
+	return c.do(ctx, "POST", p("products", product, "restore"), map[string]string{"machine": machine}, nil)
 }
 
 // Events returns the product's latest activity, newest first.

@@ -5,6 +5,8 @@ import (
 	"crypto/ed25519"
 	"crypto/mldsa"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 )
 
@@ -55,6 +57,15 @@ func (k PublicKey) Verify(message, sig []byte) bool {
 	}
 	return ed25519.Verify(k.ed, message, sig[:ed25519.SignatureSize]) &&
 		mldsa.Verify(k.ml, message, sig[ed25519.SignatureSize:], nil) == nil
+}
+
+// MachineID returns the short id of an installation key, written
+// "<alg>:<base64url>" as a lease names it: the first 16 hex digits of the
+// SHA-256 of that text. Admins see a machine by its id, and revoke or
+// restore it by its id, as a 2.7 KB key is too long to read or type.
+func MachineID(key string) string {
+	h := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(h[:8])
 }
 
 // DecodeKey reads a public key written "<alg>:<base64url>". A key with

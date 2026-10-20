@@ -146,6 +146,18 @@ func TestKeys(t *testing.T) {
 	}
 }
 
+func TestMachineID(t *testing.T) {
+	a, b := mustKey(t).Public().String(), mustKey(t).Public().String()
+	id := MachineID(a)
+	if len(id) != 16 || strings.Trim(id, "0123456789abcdef") != "" || id != MachineID(a) || id == MachineID(b) {
+		t.Errorf("MachineID %q, %q", id, MachineID(b))
+	}
+	// Pinned, so that every SDK and the server agree.
+	if got := MachineID("ed25519-mldsa65:AAAA"); got != "6a7f662d752ffabd" {
+		t.Errorf("MachineID of a fixed key: %s", got)
+	}
+}
+
 func mustKey(t testing.TB) *PrivateKey {
 	k, err := GenerateKey()
 	if err != nil {
