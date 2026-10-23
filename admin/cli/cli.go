@@ -42,6 +42,9 @@ Products:
                 -terms N, -terms-url URL, -contact EMAIL
       -describe "module: what it is for" (again for each), -hidden a,
                 -usage on|off (collect counts of the commands apps run)
+  delete ID -confirm ID               delete the product in seven days; apps are
+                                      refused from now on
+  undelete ID                         take a deletion back before it is due
   key add ID                          a new signing key, current from now
   key retire ID KID                   remove an old key
   admin add ID EMAIL                  let someone manage the product
@@ -155,15 +158,36 @@ func Run(ctx context.Context, args []string, env Env) error {
 	case "products":
 		ps, err := c.Products(ctx)
 		return r.show(ps, err, func() {
-			fmt.Fprintln(r.tw, "ID\tNAME\tMODULES\tFREE\tTRIAL\tOFFLINE")
+			fmt.Fprintln(r.tw, "ID\tNAME\tMODULES\tFREE\tTRIAL\tOFFLINE\tDELETED ON")
 			for _, p := range ps {
-				fmt.Fprintf(r.tw, "%s\t%s\t%s\t%s\t%s\t%dh\n", p.ID, p.Name, list(p.Modules), list(p.Free), trial(p.Settings), hours(p.LeaseHours))
+				fmt.Fprintf(r.tw, "%s\t%s\t%s\t%s\t%s\t%dh\t%s\n", p.ID, p.Name, list(p.Modules), list(p.Free), trial(p.Settings), hours(p.LeaseHours), deleteOn(p))
 			}
 		})
 	case "create":
 		return r.create(rest)
 	case "product":
 		return r.product(rest)
+	case "delete":
+		fs := flags("delete")
+		confirm := fs.String("confirm", "", "the product's id again")
+		pos, err := parse(fs, rest, 1, "delete ID -confirm ID")
+		if err != nil {
+			return err
+		}
+		if *confirm != pos[0] {
+			return fmt.Errorf("to delete %s, confirm with its id: licensebox delete %s -confirm %s", pos[0], pos[0], pos[0])
+		}
+		pr, err := r.c.DeleteProduct(ctx, pos[0], *confirm)
+		return r.show(pr, err, func() {
+			fmt.Fprintf(r.tw, "%s is deleted for good on %s, with its keys, users, grants and machines; apps are refused from now on.\nUntil then, licensebox undelete %s takes it back.\n", pr.ID, pr.DeleteAt.Local().Format("2006-01-02 15:04"), pr.ID)
+		})
+	case "undelete":
+		pos, err := parse(flags("undelete"), rest, 1, "undelete ID")
+		if err != nil {
+			return err
+		}
+		pr, err := r.c.UndeleteProduct(ctx, pos[0])
+		return r.show(pr, err, func() { fmt.Fprintf(r.tw, "%s is no longer to be deleted; apps sign in again.\n", pr.ID) })
 	case "key":
 		return r.key(rest)
 	case "admin":
@@ -538,6 +562,9 @@ func (r runner) product(args []string) error {
 }
 
 func (r runner) settings(p admin.Product) {
+	if !p.DeleteAt.IsZero() {
+		fmt.Fprintf(r.tw, "TO BE DELETED\t%s (licensebox undelete %s takes it back)\n", deleteOn(p), p.ID)
+	}
 	fmt.Fprintf(r.tw, "id\t%s\nname\t%s\nmodules\t%s\nfree\t%s\nhidden\t%s\ntrial\t%s\noffline\t%d hours\nterms\t%s\ncontact\t%s\nusage\t%s\n",
 		p.ID, p.Name, list(p.Modules), list(p.Free), list(p.Hidden), trial(p.Settings), hours(p.LeaseHours), terms(p.Settings), dash(p.Contact), onOff(p.Usage))
 	fmt.Fprintf(r.tw, "machine seats\t%d (0 is unrestricted)\nallowed areas\t%s\nblocked areas\t%s\n", p.MachineLimit, strings.ReplaceAll(policy.FormatAreas(p.Locations.Allow), "\n", "; "), strings.ReplaceAll(policy.FormatAreas(p.Locations.Block), "\n", "; "))
@@ -551,6 +578,14 @@ func (r runner) settings(p admin.Product) {
 	} else {
 		fmt.Fprintln(r.tw, "heartbeat\tdisabled")
 	}
+}
+
+// deleteOn is when the product is to be deleted, or "-".
+func deleteOn(p admin.Product) string {
+	if p.DeleteAt.IsZero() {
+		return "-"
+	}
+	return p.DeleteAt.Local().Format("2006-01-02 15:04")
 }
 
 func onOff(b bool) string {

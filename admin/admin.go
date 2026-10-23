@@ -71,6 +71,9 @@ type Product struct {
 	Settings
 	Admins  []string  `json:"admins"`
 	Created time.Time `json:"created"`
+	// DeleteAt, if set, is when the product is deleted for good; until
+	// then apps are refused, and UndeleteProduct takes it back.
+	DeleteAt time.Time `json:"delete_at,omitzero"`
 }
 
 // Settings are what an admin sets on a product.
@@ -364,6 +367,19 @@ func (c *Client) CreateProduct(ctx context.Context, id string, s Settings) (Crea
 func (c *Client) UpdateProduct(ctx context.Context, id string, s Settings) (Product, error) {
 	var pr Product
 	return pr, c.do(ctx, "PUT", p("products", id), s, &pr)
+}
+
+// DeleteProduct schedules the product's deletion, seven days on; confirm
+// must be its id again. From now on apps are refused as if it were gone.
+func (c *Client) DeleteProduct(ctx context.Context, id, confirm string) (Product, error) {
+	var pr Product
+	return pr, c.do(ctx, "DELETE", p("products", id), map[string]string{"confirm": confirm}, &pr)
+}
+
+// UndeleteProduct takes back a scheduled deletion that is not yet due.
+func (c *Client) UndeleteProduct(ctx context.Context, id string) (Product, error) {
+	var pr Product
+	return pr, c.do(ctx, "POST", p("products", id, "undelete"), nil, &pr)
 }
 
 func (c *Client) Keys(ctx context.Context, product string) ([]Key, error) {
