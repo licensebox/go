@@ -43,7 +43,8 @@ if _, err := lic.Require(ctx, "export"); err != nil {
 - `admin`: the admin API, for automating access decisions such as granting
   modules after an admin approves a request.
 - `cmd/licensebox`: the admin command: create products, grant modules,
-  revoke users and machines.
+  revoke users and machines, delete products (after seven days, to be
+  taken back until then).
 
 ```
 go install licensebox.dev/cmd/licensebox@latest
