@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -55,6 +56,8 @@ Users:
   user ID EMAIL                       a user's grants and machines
   grant ID EMAIL MODULE... [-until 2027-01-31 | -days N] [-note text]
   ungrant ID EMAIL MODULE...
+  seats ID EMAIL N | default          this user's machine seats (0 is unrestricted),
+                                      or back to the product's
   revoke ID EMAIL [-note text]        refuse the user's apps from their next check
   revoke ID -machine MACHINE          refuse one machine, by its id from 'user'
   restore ID EMAIL | -machine MACHINE
@@ -215,6 +218,21 @@ func Run(ctx context.Context, args []string, env Env) error {
 		return r.show(u, err, func() { r.user(u) })
 	case "grant", "ungrant":
 		return r.grant(cmd, rest)
+	case "seats":
+		pos, err := parse(flags("seats"), rest, 3, "seats ID EMAIL N|default")
+		if err != nil {
+			return err
+		}
+		var limit *int
+		if pos[2] != "default" {
+			n, err := strconv.Atoi(pos[2])
+			if err != nil {
+				return errors.New("seats: a number, or default")
+			}
+			limit = &n
+		}
+		u, err := c.SetSeats(ctx, pos[0], pos[1], limit)
+		return r.show(u, err, func() { r.user(u) })
 	case "revoke", "restore":
 		return r.revoke(cmd, rest)
 	case "events":
@@ -654,6 +672,14 @@ func (r runner) admin(args []string) error {
 func (r runner) user(u admin.User) {
 	fmt.Fprintf(r.tw, "%s\t%s, user since %s\n", u.Email, state(u.Revoked), date(u.Created))
 	fmt.Fprintf(r.tw, "uses it for\t%s\n", dash(u.Purpose))
+	switch {
+	case u.MachineLimit == nil:
+		fmt.Fprintf(r.tw, "seats\tproduct default\n")
+	case *u.MachineLimit == 0:
+		fmt.Fprintf(r.tw, "seats\tunrestricted, for this user\n")
+	default:
+		fmt.Fprintf(r.tw, "seats\t%d, for this user\n", *u.MachineLimit)
+	}
 	if u.Note != "" {
 		fmt.Fprintf(r.tw, "note\t%s\n", u.Note)
 	}

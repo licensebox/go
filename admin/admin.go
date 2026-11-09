@@ -179,6 +179,8 @@ type User struct {
 	Note     string    `json:"note"`
 	Machines []Machine `json:"machines"`
 	Grants   []Grant   `json:"grants"`
+	// MachineLimit is this user's own seats; nil is the product's.
+	MachineLimit *int `json:"machine_limit,omitempty"`
 }
 
 // Machine is an installation.
@@ -418,6 +420,13 @@ func (c *Client) Users(ctx context.Context, product, q string) ([]User, error) {
 func (c *Client) User(ctx context.Context, product, email string) (User, error) {
 	var u User
 	return u, c.do(ctx, "GET", p("products", product, "users", email), nil, &u)
+}
+
+// SetSeats sets how many machines a user may use the product on: zero is
+// unrestricted, nil returns them to the product's.
+func (c *Client) SetSeats(ctx context.Context, product, email string, limit *int) (User, error) {
+	var u User
+	return u, c.do(ctx, "POST", p("products", product, "seats"), map[string]any{"email": email, "limit": limit}, &u)
 }
 
 // Grant grants modules; the address need not have signed in yet.
