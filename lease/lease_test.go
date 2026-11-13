@@ -191,3 +191,14 @@ func mustDec(t *testing.T, s string) []byte {
 	}
 	return b
 }
+
+func TestHasCheckouts(t *testing.T) {
+	l := Lease{Modules: []string{"core"}, Floating: []string{"solver"}, Elsewhere: []string{"server"}}
+	if !l.Has("core") || l.Has("solver") || l.Has("server") {
+		t.Fatal("modules alone")
+	}
+	l.Checkouts = []string{"solver"}
+	if !l.Has("solver") {
+		t.Fatal("a checked-out copy is not authorized")
+	}
+}

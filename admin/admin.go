@@ -91,8 +91,13 @@ type Settings struct {
 	// Heartbeat controls optional long-running application checks; zero disables.
 	Heartbeat policy.Heartbeat `json:"heartbeat"`
 	// MachineLimit is seats per user and product; zero means unrestricted.
-	MachineLimit int              `json:"machine_limit"`
-	Locations    policy.Locations `json:"locations"`
+	MachineLimit int `json:"machine_limit"`
+	// ModuleSeats are seats per user for modules counted apart from the
+	// product, by module: such a module runs only on machines holding
+	// one of its seats. Nil leaves them as they are on update; an empty
+	// map clears them.
+	ModuleSeats map[string]int   `json:"module_seats"`
+	Locations   policy.Locations `json:"locations"`
 	// Terms is the version of the terms users accept, at TermsURL.
 	Terms    int    `json:"terms"`
 	TermsURL string `json:"terms_url"`
@@ -181,6 +186,64 @@ type User struct {
 	Grants   []Grant   `json:"grants"`
 	// MachineLimit is this user's own seats; nil is the product's.
 	MachineLimit *int `json:"machine_limit,omitempty"`
+	// Customer is the organisation the user belongs to; Service marks a
+	// service account, which has a Name and no email.
+	Customer string `json:"customer,omitempty"`
+	Service  bool   `json:"service,omitempty"`
+	Name     string `json:"name,omitempty"`
+}
+
+// Label is how the user is named to admins: their email, or a service
+// account's name.
+func (u User) Label() string {
+	if u.Service {
+		return "service:" + u.Name
+	}
+	return u.Email
+}
+
+// Customer is an organisation that buys a product: its members, service
+// accounts, and pools of floating copies by module.
+type Customer struct {
+	ID        string         `json:"id"`
+	Product   string         `json:"product"`
+	Name      string         `json:"name"`
+	Pools     map[string]int `json:"pools,omitempty"`
+	Note      string         `json:"note,omitempty"`
+	Created   time.Time      `json:"created"`
+	Members   []User         `json:"members"`
+	Checkouts []Checkout     `json:"checkouts"`
+}
+
+// CustomerRequest creates or changes a customer. Pools are floating
+// copies by module; nil leaves them as they are, zero removes one.
+type CustomerRequest struct {
+	ID    string          `json:"id"`
+	Name  string          `json:"name"`
+	Note  string          `json:"note"`
+	Pools *map[string]int `json:"pools,omitempty"`
+}
+
+// Checkout is a floating copy a machine holds, until Expires unless
+// its heartbeats renew it.
+type Checkout struct {
+	ID        string    `json:"id"`
+	Customer  string    `json:"customer"`
+	Module    string    `json:"module"`
+	User      string    `json:"user"`
+	Machine   string    `json:"machine"`
+	MachineID string    `json:"machine_id"`
+	Who       string    `json:"who"`
+	Since     time.Time `json:"since"`
+	Expires   time.Time `json:"expires"`
+}
+
+// EnrolmentToken is a service account's one-time token, shown once: the
+// machine it is set on signs in with it, without a person.
+type EnrolmentToken struct {
+	Token   string    `json:"token"`
+	Name    string    `json:"name"`
+	Expires time.Time `json:"expires"`
 }
 
 // Machine is an installation.
@@ -196,6 +259,8 @@ type Machine struct {
 	Last      time.Time       `json:"last"`
 	Revoked   bool            `json:"revoked"`
 	Allocated bool            `json:"allocated"`
+	// SeatedModules are the modules counted apart whose seats it holds.
+	SeatedModules []string `json:"seated_modules,omitempty"`
 }
 
 // Grant lets a user run a module until a time, or always where Until is
@@ -229,9 +294,10 @@ type Event struct {
 	By      string    `json:"by"`
 }
 
-// Stats counts a product's users and machines.
+// Stats counts a product's users, service accounts and machines.
 type Stats struct {
 	Users    int            `json:"users"`
+	Services int            `json:"services"`
 	Revoked  int            `json:"revoked"`
 	Machines int            `json:"machines"`
 	Active   int            `json:"active_machines"`
@@ -510,4 +576,61 @@ func (c *Client) Allow(ctx context.Context, email string) error {
 
 func (c *Client) Disallow(ctx context.Context, email string) error {
 	return c.do(ctx, "DELETE", p("allowed", email), nil, nil)
+}
+
+// Customers returns the product's customers, with their members and live
+// checkouts.
+func (c *Client) Customers(ctx context.Context, product string) ([]Customer, error) {
+	var cs []Customer
+	return cs, c.do(ctx, "GET", p("products", product, "customers"), nil, &cs)
+}
+
+func (c *Client) Customer(ctx context.Context, product, id string) (Customer, error) {
+	var x Customer
+	return x, c.do(ctx, "GET", p("products", product, "customers", id), nil, &x)
+}
+
+func (c *Client) AddCustomer(ctx context.Context, product string, r CustomerRequest) (Customer, error) {
+	var x Customer
+	return x, c.do(ctx, "POST", p("products", product, "customers"), r, &x)
+}
+
+// UpdateCustomer changes a customer's name, note, or pools (nil Pools
+// leaves them).
+func (c *Client) UpdateCustomer(ctx context.Context, product string, r CustomerRequest) (Customer, error) {
+	var x Customer
+	return x, c.do(ctx, "PUT", p("products", product, "customers", r.ID), r, &x)
+}
+
+// SetCustomer moves a user, by email or service account name, to a
+// customer, or out of any with customer "".
+func (c *Client) SetCustomer(ctx context.Context, product, user, customer string) (User, error) {
+	var u User
+	return u, c.do(ctx, "POST", p("products", product, "customer"), map[string]string{"email": user, "customer": customer}, &u)
+}
+
+// AddService creates a service account under a customer. Grant it
+// modules by its name, as a user by email.
+func (c *Client) AddService(ctx context.Context, product, customer, name string) (User, error) {
+	var u User
+	return u, c.do(ctx, "POST", p("products", product, "services"), map[string]string{"customer": customer, "name": name}, &u)
+}
+
+// ServiceToken issues a service account a one-time enrolment token. The
+// machine that enrols with it replaces the account's machine before it.
+func (c *Client) ServiceToken(ctx context.Context, product, name string) (EnrolmentToken, error) {
+	var t EnrolmentToken
+	return t, c.do(ctx, "POST", p("products", product, "services", name, "token"), nil, &t)
+}
+
+// Checkouts returns the product's live floating checkouts.
+func (c *Client) Checkouts(ctx context.Context, product string) ([]Checkout, error) {
+	var cs []Checkout
+	return cs, c.do(ctx, "GET", p("products", product, "checkouts"), nil, &cs)
+}
+
+// FreeCheckout frees a checkout by hand, returning its copy to the pool.
+func (c *Client) FreeCheckout(ctx context.Context, product, id string) (Checkout, error) {
+	var x Checkout
+	return x, c.do(ctx, "DELETE", p("products", product, "checkouts", id), nil, &x)
 }

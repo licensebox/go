@@ -71,8 +71,15 @@ func (c *Client) Heartbeat(ctx context.Context, module string) (HeartbeatResult,
 	cancel()
 	if err == nil {
 		c.checked = &fresh
+		if !fresh.Has(module) && floating(fresh, module) && slices.Contains(kept.Checkouts, module) {
+			// The copy lapsed, as after a gap longer than the grace,
+			// or an admin freed it: it is taken again if one is free.
+			if fresh, err = c.checkout(ctx, module); err != nil {
+				return HeartbeatResult{}, err
+			}
+		}
 		if !fresh.Has(module) {
-			return HeartbeatResult{}, &ModuleError{Product: c.cfg.Product, Module: module, Email: fresh.Email}
+			return HeartbeatResult{}, &ModuleError{Product: c.cfg.Product, Module: module, Email: fresh.Email, Elsewhere: slices.Contains(fresh.Elsewhere, module)}
 		}
 		return c.heartbeatResult(fresh, true)
 	}

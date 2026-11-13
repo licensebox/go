@@ -39,7 +39,9 @@ Products:
   product ID                          a product's settings, keys and admins
   product ID [settings]               change settings; those not given are kept
       settings: -name, -modules a,b, -free a, -trial b, -trial-days N,
-                -lease-hours N, -machine-limit N, -allow-areas AREAS, -block-areas AREAS,
+                -lease-hours N, -machine-limit N, -module-seats a=1,b=2,
+                -heartbeat-interval N, -heartbeat-grace N,
+                -allow-areas AREAS, -block-areas AREAS,
                 -terms N, -terms-url URL, -contact EMAIL
       -describe "module: what it is for" (again for each), -hidden a,
                 -usage on|off (collect counts of the commands apps run)
@@ -51,11 +53,11 @@ Products:
   admin add ID EMAIL                  let someone manage the product
   admin remove ID EMAIL
 
-Users:
-  users ID [-q text]                  the product's users
-  user ID EMAIL                       a user's grants and machines
-  grant ID EMAIL MODULE... [-until 2027-01-31 | -days N] [-note text]
-  ungrant ID EMAIL MODULE...
+Users (a USER is an email address, or a service account's name):
+  users ID [-q text]                  the product's users and service accounts
+  user ID USER                        a user's grants and machines
+  grant ID USER MODULE... [-until 2027-01-31 | -days N] [-note text]
+  ungrant ID USER MODULE...
   seats ID EMAIL N | default          this user's machine seats (0 is unrestricted),
                                       or back to the product's
   revoke ID EMAIL [-note text]        refuse the user's apps from their next check
@@ -68,6 +70,20 @@ Users:
   events ID [-n 50]                   the latest activity
   stats ID                            users and machines
   usage ID [-days 30]                 commands run, by command, user and version
+
+Customers, service accounts and floating copies:
+  customers ID                        the product's customers, their pools and copies in use
+  customer ID CUSTOMER                a customer's members and checkouts
+  customer add ID CUSTOMER [-name N] [-note text] [-pools a=5,b=2]
+  customer set ID CUSTOMER [-name N] [-note text] [-pools a=5,b=2]
+                                      pools are floating copies by module (needs a heartbeat)
+  member ID USER CUSTOMER | none      move a user to a customer, or out of any
+  service add ID CUSTOMER NAME        a service account: a server or runner, licensed by name
+  service token ID NAME               a one-time token to enrol its machine (set it as
+                                      LICENSEBOX_ENROL_TOKEN there); a new token replaces
+                                      the machine enrolled before
+  checkouts ID                        floating copies in use
+  free ID CHECKOUT                    free a copy by hand
 
 Operators:
   allowed | allow EMAIL | disallow EMAIL   who may create products
@@ -204,13 +220,13 @@ func Run(ctx context.Context, args []string, env Env) error {
 		}
 		us, err := c.Users(ctx, pos[0], *q)
 		return r.show(us, err, func() {
-			fmt.Fprintln(r.tw, "EMAIL\tSINCE\tUSES IT FOR\tMACHINES\tGRANTED\tSTATE")
+			fmt.Fprintln(r.tw, "USER\tCUSTOMER\tSINCE\tUSES IT FOR\tMACHINES\tGRANTED\tSTATE")
 			for _, u := range us {
-				fmt.Fprintf(r.tw, "%s\t%s\t%s\t%d\t%s\t%s\n", u.Email, date(u.Created), dash(u.Purpose), len(u.Machines), granted(u.Grants), state(u.Revoked))
+				fmt.Fprintf(r.tw, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n", u.Label(), dash(u.Customer), date(u.Created), dash(u.Purpose), len(u.Machines), granted(u.Grants), state(u.Revoked))
 			}
 		})
 	case "user":
-		pos, err := parse(flags("user"), rest, 2, "user ID EMAIL")
+		pos, err := parse(flags("user"), rest, 2, "user ID USER")
 		if err != nil {
 			return err
 		}
@@ -256,7 +272,7 @@ func Run(ctx context.Context, args []string, env Env) error {
 		}
 		st, err := c.Stats(ctx, pos[0])
 		return r.show(st, err, func() {
-			fmt.Fprintf(r.tw, "users\t%d (%d revoked)\n", st.Users, st.Revoked)
+			fmt.Fprintf(r.tw, "users\t%d, and %d service accounts (%d revoked)\n", st.Users, st.Services, st.Revoked)
 			fmt.Fprintf(r.tw, "machines\t%d, %d active in the last 30 days\n", st.Machines, st.Active)
 			vs := make([]string, 0, len(st.Versions))
 			for v := range st.Versions {
@@ -349,6 +365,47 @@ func Run(ctx context.Context, args []string, env Env) error {
 				fmt.Fprintln(r.tw)
 			}
 		})
+	case "customers":
+		pos, err := parse(flags("customers"), rest, 1, "customers ID")
+		if err != nil {
+			return err
+		}
+		cs, err := c.Customers(ctx, pos[0])
+		return r.show(cs, err, func() {
+			fmt.Fprintln(r.tw, "CUSTOMER\tNAME\tMEMBERS\tPOOLS\tIN USE")
+			for _, x := range cs {
+				fmt.Fprintf(r.tw, "%s\t%s\t%d\t%s\t%s\n", x.ID, x.Name, len(x.Members), dash(countsText(x.Pools)), dash(inUse(x.Checkouts)))
+			}
+		})
+	case "customer":
+		return r.customer(rest)
+	case "member":
+		pos, err := parse(flags("member"), rest, 3, "member ID USER CUSTOMER|none")
+		if err != nil {
+			return err
+		}
+		customer := pos[2]
+		if customer == "none" {
+			customer = ""
+		}
+		u, err := c.SetCustomer(ctx, pos[0], pos[1], customer)
+		return r.show(u, err, func() { r.user(u) })
+	case "service":
+		return r.service(rest)
+	case "checkouts":
+		pos, err := parse(flags("checkouts"), rest, 1, "checkouts ID")
+		if err != nil {
+			return err
+		}
+		cs, err := c.Checkouts(ctx, pos[0])
+		return r.show(cs, err, func() { r.checkouts(cs) })
+	case "free":
+		pos, err := parse(flags("free"), rest, 2, "free ID CHECKOUT")
+		if err != nil {
+			return err
+		}
+		x, err := c.FreeCheckout(ctx, pos[0], pos[1])
+		return r.show(x, err, func() { fmt.Fprintf(r.tw, "Freed %s's copy of %s on machine %s.\n", x.Customer, x.Module, x.MachineID) })
 	case "allowed":
 		as, err := c.Allowed(ctx)
 		return r.show(as, err, func() {
@@ -462,6 +519,12 @@ func settings(fs *flag.FlagSet) func(s *admin.Settings) {
 	heartbeatInterval := fs.Int("heartbeat-interval", 0, "optional heartbeat interval in seconds; 0 disables")
 	heartbeatGrace := fs.Int("heartbeat-grace", 0, "maximum seconds without successful contact for heartbeat products")
 	machineLimit := fs.Int("machine-limit", 0, "machine seats per user; 0 means unrestricted; new sign-ins transfer the oldest seat")
+	var moduleSeats map[string]int
+	fs.Func("module-seats", "seats per user for modules counted apart, as server=1,sim=2; empty clears", func(v string) error {
+		var err error
+		moduleSeats, err = counts(v)
+		return err
+	})
 	var allowAreas, blockAreas []policy.Area
 	fs.Func("allow-areas", "allowed countries, cities or radii, separated by semicolons", func(text string) error { var err error; allowAreas, err = policy.ParseAreas(text); return err })
 	fs.Func("block-areas", "blocked countries, cities or radii, separated by semicolons", func(text string) error { var err error; blockAreas, err = policy.ParseAreas(text); return err })
@@ -502,6 +565,8 @@ func settings(fs *flag.FlagSet) func(s *admin.Settings) {
 				s.Heartbeat.GraceSeconds = *heartbeatGrace
 			case "machine-limit":
 				s.MachineLimit = *machineLimit
+			case "module-seats":
+				s.ModuleSeats = moduleSeats
 			case "allow-areas":
 				s.Locations.Allow = allowAreas
 			case "block-areas":
@@ -585,6 +650,9 @@ func (r runner) settings(p admin.Product) {
 	}
 	fmt.Fprintf(r.tw, "id\t%s\nname\t%s\nmodules\t%s\nfree\t%s\nhidden\t%s\ntrial\t%s\noffline\t%d hours\nterms\t%s\ncontact\t%s\nusage\t%s\n",
 		p.ID, p.Name, list(p.Modules), list(p.Free), list(p.Hidden), trial(p.Settings), hours(p.LeaseHours), terms(p.Settings), dash(p.Contact), onOff(p.Usage))
+	if len(p.ModuleSeats) > 0 {
+		fmt.Fprintf(r.tw, "module seats\t%s (counted apart from the product's)\n", countsText(p.ModuleSeats))
+	}
 	fmt.Fprintf(r.tw, "machine seats\t%d (0 is unrestricted)\nallowed areas\t%s\nblocked areas\t%s\n", p.MachineLimit, strings.ReplaceAll(policy.FormatAreas(p.Locations.Allow), "\n", "; "), strings.ReplaceAll(policy.FormatAreas(p.Locations.Block), "\n", "; "))
 	for _, m := range p.Modules {
 		if d := p.Descriptions[m]; d != "" {
@@ -670,9 +738,18 @@ func (r runner) admin(args []string) error {
 }
 
 func (r runner) user(u admin.User) {
-	fmt.Fprintf(r.tw, "%s\t%s, user since %s\n", u.Email, state(u.Revoked), date(u.Created))
-	fmt.Fprintf(r.tw, "uses it for\t%s\n", dash(u.Purpose))
+	kind := "user"
+	if u.Service {
+		kind = "service account"
+	}
+	fmt.Fprintf(r.tw, "%s\t%s, %s since %s\n", u.Label(), state(u.Revoked), kind, date(u.Created))
+	fmt.Fprintf(r.tw, "customer\t%s\n", dash(u.Customer))
+	if !u.Service {
+		fmt.Fprintf(r.tw, "uses it for\t%s\n", dash(u.Purpose))
+	}
 	switch {
+	case u.Service:
+		fmt.Fprintf(r.tw, "seats\tone machine, a service account's\n")
 	case u.MachineLimit == nil:
 		fmt.Fprintf(r.tw, "seats\tproduct default\n")
 	case *u.MachineLimit == 0:
@@ -691,7 +768,7 @@ func (r runner) user(u admin.User) {
 	}
 	r.tw.Flush()
 	fmt.Fprintln(r.env.Out)
-	fmt.Fprintln(r.tw, "MACHINE\tSYSTEM\tVERSION\tLAST CHECK\tSTATE")
+	fmt.Fprintln(r.tw, "MACHINE\tSYSTEM\tVERSION\tLAST CHECK\tSTATE\tMODULE SEATS")
 	for _, m := range u.Machines {
 		seatState := "seat transferred"
 		if m.Allocated {
@@ -700,8 +777,133 @@ func (r runner) user(u admin.User) {
 		if m.Revoked {
 			seatState = "revoked"
 		}
-		fmt.Fprintf(r.tw, "%s\t%s/%s\t%s\t%s\t%s\n", m.ID, m.OS, m.Arch, dash(m.Version), m.Last.UTC().Format("2006-01-02 15:04"), seatState)
+		fmt.Fprintf(r.tw, "%s\t%s/%s\t%s\t%s\t%s\t%s\n", m.ID, m.OS, m.Arch, dash(m.Version), m.Last.UTC().Format("2006-01-02 15:04"), seatState, list(m.SeatedModules))
 	}
+}
+
+func (r runner) customer(args []string) error {
+	if len(args) > 0 && (args[0] == "add" || args[0] == "set") {
+		fs := flags("customer " + args[0])
+		name := fs.String("name", "", "the customer's name")
+		note := fs.String("note", "", "for the record")
+		var pools *map[string]int
+		fs.Func("pools", "floating copies by module, as sim=5,solve=2; a module at 0 has none", func(v string) error {
+			m, err := counts(v)
+			pools = &m
+			return err
+		})
+		pos, err := parse(fs, args[1:], 2, "customer "+args[0]+" ID CUSTOMER [-name N] [-note text] [-pools a=5]")
+		if err != nil {
+			return err
+		}
+		req := admin.CustomerRequest{ID: pos[1], Name: *name, Note: *note, Pools: pools}
+		var x admin.Customer
+		if args[0] == "add" {
+			x, err = r.c.AddCustomer(r.ctx, pos[0], req)
+		} else {
+			if *note == "" {
+				old, err := r.c.Customer(r.ctx, pos[0], pos[1])
+				if err != nil {
+					return err
+				}
+				req.Note = old.Note
+			}
+			x, err = r.c.UpdateCustomer(r.ctx, pos[0], req)
+		}
+		return r.show(x, err, func() { r.customerInfo(x) })
+	}
+	pos, err := parse(flags("customer"), args, 2, "customer ID CUSTOMER | customer add|set ID CUSTOMER ...")
+	if err != nil {
+		return err
+	}
+	x, err := r.c.Customer(r.ctx, pos[0], pos[1])
+	return r.show(x, err, func() { r.customerInfo(x) })
+}
+
+func (r runner) customerInfo(x admin.Customer) {
+	fmt.Fprintf(r.tw, "%s\t%s, since %s\n", x.ID, x.Name, date(x.Created))
+	fmt.Fprintf(r.tw, "floating copies\t%s\n", dash(countsText(x.Pools)))
+	if x.Note != "" {
+		fmt.Fprintf(r.tw, "note\t%s\n", x.Note)
+	}
+	r.tw.Flush()
+	fmt.Fprintln(r.env.Out)
+	fmt.Fprintln(r.tw, "MEMBER\tSINCE\tSTATE")
+	for _, m := range x.Members {
+		fmt.Fprintf(r.tw, "%s\t%s\t%s\n", m.Label(), date(m.Created), state(m.Revoked))
+	}
+	r.tw.Flush()
+	fmt.Fprintln(r.env.Out)
+	r.checkouts(x.Checkouts)
+}
+
+func (r runner) checkouts(cs []admin.Checkout) {
+	fmt.Fprintln(r.tw, "CHECKOUT\tCUSTOMER\tMODULE\tBY\tMACHINE\tSINCE (UTC)\tLAPSES (UTC)")
+	for _, c := range cs {
+		fmt.Fprintf(r.tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", c.ID, c.Customer, c.Module, dash(c.Who), c.MachineID, c.Since.UTC().Format("2006-01-02 15:04"), c.Expires.UTC().Format("15:04:05"))
+	}
+}
+
+func (r runner) service(args []string) error {
+	if len(args) > 0 && args[0] == "add" {
+		pos, err := parse(flags("service add"), args[1:], 3, "service add ID CUSTOMER NAME")
+		if err != nil {
+			return err
+		}
+		u, err := r.c.AddService(r.ctx, pos[0], pos[1], pos[2])
+		return r.show(u, err, func() {
+			r.user(u)
+			r.tw.Flush()
+			fmt.Fprintf(r.env.Out, "\nGrant it modules with: licensebox grant %s %s MODULE...\nEnrol its machine with a token from: licensebox service token %s %s\n", pos[0], pos[2], pos[0], pos[2])
+		})
+	}
+	if len(args) > 0 && args[0] == "token" {
+		pos, err := parse(flags("service token"), args[1:], 2, "service token ID NAME")
+		if err != nil {
+			return err
+		}
+		t, err := r.c.ServiceToken(r.ctx, pos[0], pos[1])
+		return r.show(t, err, func() {
+			fmt.Fprintf(r.tw, "%s\n\nSet it on the machine as LICENSEBOX_ENROL_TOKEN (or client.Config.Token) before the app's\nfirst run there. It works once, until %s, and the machine it enrols\nreplaces any enrolled for %s before.\n", t.Token, t.Expires.Local().Format("2006-01-02 15:04"), t.Name)
+		})
+	}
+	return errors.New("usage: licensebox service add ID CUSTOMER NAME | service token ID NAME")
+}
+
+// counts reads "a=1,b=2"; an empty string is an empty map.
+func counts(v string) (map[string]int, error) {
+	out := map[string]int{}
+	for _, part := range split(v) {
+		k, n, ok := strings.Cut(part, "=")
+		c, err := strconv.Atoi(strings.TrimSpace(n))
+		if !ok || err != nil {
+			return nil, fmt.Errorf("%q: want module=N", part)
+		}
+		out[strings.TrimSpace(k)] = c
+	}
+	return out, nil
+}
+
+func countsText(m map[string]int) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		parts[i] = fmt.Sprintf("%s=%d", k, m[k])
+	}
+	return strings.Join(parts, ",")
+}
+
+// inUse counts checkouts by module, as "sim=3".
+func inUse(cs []admin.Checkout) string {
+	m := map[string]int{}
+	for _, c := range cs {
+		m[c.Module]++
+	}
+	return countsText(m)
 }
 
 func (r runner) grant(cmd string, args []string) error {

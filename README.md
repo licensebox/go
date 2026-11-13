@@ -161,3 +161,48 @@ within the grace period (or an earlier offline/grant limit), including for older
 clients. `Watch` uses the signed interval unless the caller chooses a faster
 one. The policy does not start a monitor in an application that never opts in.
 An offline client discovers a new revocation at contact or signed expiry.
+
+## Seats per module
+
+A module can have seats of its own, overriding the product's for that module
+(`licensebox product myapp -module-seats server=1`). It is in a machine's lease
+only while that machine holds one of its seats; elsewhere the lease lists it in
+`Elsewhere`, and `Require` returns a `*client.ModuleError` with `Elsewhere` set,
+whose message says that an explicit sign-in here moves the seat.
+
+## Floating copies
+
+A customer can hold a pool of floating copies of a module
+(`licensebox customer add myapp acme -pools solver=5`). The lease lists such
+modules in `Floating`. `Require` checks a copy out when the module is not held
+outright, and returns `client.ErrNoFreeCopy` when every copy is in use. Keep
+the copy with `Heartbeat` or `Watch` while the work runs, and return it after:
+
+```go
+if _, err := lic.Require(ctx, "solver"); err != nil {
+    return err // ErrNoFreeCopy: all copies in use
+}
+defer lic.Checkin(context.Background(), "solver")
+work, stop, err := lic.Watch(ctx, "solver", client.WatchOptions{})
+if err != nil {
+    return err
+}
+defer stop()
+return solve(work)
+```
+
+`Checkout` takes a copy explicitly. A copy lives only as long as the lease, so
+floating modules need the product's heartbeat and a connection; a crashed app
+frees its copy when the grace passes, and a heartbeat takes a lapsed copy again
+if one is free. Copies are counted per installation, not per process.
+
+## Service accounts
+
+A server or build runner can be licensed in its own name. An admin creates the
+account and issues a one-time token (`licensebox service add myapp acme
+build-1`, `licensebox service token myapp build-1`). Set it on the machine as
+`LICENSEBOX_ENROL_TOKEN`, or as `client.Config.Token`; the first `Require`,
+`Lease` or `SignIn` enrols the machine without a browser. `lic.Enrol(ctx,
+token)` does it explicitly. A used or expired token returns
+`client.ErrEnrolment`. A new token enrols a new machine and revokes the one
+before.

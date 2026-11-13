@@ -48,10 +48,22 @@ type Lease struct {
 	// Heartbeat is optional signed scheduling policy. Expires remains the hard
 	// authorization deadline, including for older clients.
 	Heartbeat *policy.Heartbeat `json:"heartbeat,omitempty"`
+	// Elsewhere are modules the user holds whose seats, counted apart
+	// from the product's, are on other machines: signing in here moves
+	// them back.
+	Elsewhere []string `json:"elsewhere,omitempty"`
+	// Floating are modules the user may check out from their customer's
+	// pool of floating copies; Checkouts those this machine has checked
+	// out, which it holds until Expires unless it renews.
+	Floating  []string `json:"floating,omitempty"`
+	Checkouts []string `json:"checkouts,omitempty"`
 }
 
-// Has reports whether the lease lets its holder run the module.
-func (l Lease) Has(module string) bool { return slices.Contains(l.Modules, module) }
+// Has reports whether the lease lets its holder run the module: one of
+// its modules, or a floating copy it has checked out.
+func (l Lease) Has(module string) bool {
+	return slices.Contains(l.Modules, module) || slices.Contains(l.Checkouts, module)
+}
 
 // Keys are a product's public keys, by key id.
 type Keys map[string]PublicKey
@@ -157,6 +169,14 @@ func CallMessage(alg, kind, token string, binding machine.Binding, t time.Time, 
 // a product at time t, proving it holds the key the lease will name.
 func DeviceMessage(alg, product string, binding machine.Binding, t time.Time) []byte {
 	return []byte("licensebox device v3\n" + alg + "\n" + product + "\n" + string(binding) + "\n" + t.UTC().Format(time.RFC3339))
+}
+
+// EnrolMessage returns what an installation signs to enrol, at time t, as
+// a product's service account with a one-time token an admin issued: the
+// token is bound to the key the lease will name and to the host.
+func EnrolMessage(alg, product, token string, binding machine.Binding, t time.Time) []byte {
+	h := sha256.Sum256([]byte(token))
+	return []byte("licensebox enrol v3\n" + alg + "\n" + product + "\n" + hex.EncodeToString(h[:]) + "\n" + string(binding) + "\n" + t.UTC().Format(time.RFC3339))
 }
 
 // TokenMessage binds device-flow polling to the initiating key and host.

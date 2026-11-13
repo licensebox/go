@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -63,6 +64,10 @@ type Config struct {
 	HTTP *http.Client
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
+	// Token is a service account's one-time enrolment token, with which
+	// a sign-in enrols this machine without a person; empty means the
+	// LICENSEBOX_ENROL_TOKEN environment variable, if set.
+	Token string
 }
 
 // Client holds a product's licence on this machine.
@@ -93,12 +98,23 @@ var (
 )
 
 // ModuleError is returned by Require for a module the lease leaves out.
+// Elsewhere is set when the user holds the module but its seat, counted
+// apart from the product's, is on another machine: an explicit sign-in
+// here moves it.
 type ModuleError struct {
 	Product, Module, Email string
+	Elsewhere              bool
 }
 
 func (e *ModuleError) Error() string {
-	return fmt.Sprintf("%s: the %s module is not licensed to %s", e.Product, e.Module, e.Email)
+	who := e.Email
+	if who == "" {
+		who = "this account"
+	}
+	if e.Elsewhere {
+		return fmt.Sprintf("%s: the seat of the %s module is on another machine; explicitly sign in to move it to this one", e.Product, e.Module)
+	}
+	return fmt.Sprintf("%s: the %s module is not licensed to %s", e.Product, e.Module, who)
 }
 
 // New returns a client for the product.
@@ -332,7 +348,13 @@ func (c *Client) lease(ctx context.Context) (lease.Lease, bool, error) {
 }
 
 func (c *Client) signIn(ctx context.Context) (lease.Lease, bool, error) {
-	l, err := c.signInFlow(ctx, false)
+	var l lease.Lease
+	var err error
+	if t := c.token(); t != "" {
+		l, err = c.enrol(ctx, t)
+	} else {
+		l, err = c.signInFlow(ctx, false)
+	}
 	if err != nil {
 		return l, false, err
 	}
@@ -343,7 +365,9 @@ func (c *Client) signIn(ctx context.Context) (lease.Lease, bool, error) {
 // Require returns the lease if it lets this installation run the module;
 // otherwise a *ModuleError, or the error Lease returns. If the lease
 // could not be renewed this run, it is tried once more first, in case
-// the module was granted since.
+// the module was granted since. A floating module is checked out, and
+// ErrNoFreeCopy returned if every copy is in use: call Checkin when the
+// work ends.
 func (c *Client) Require(ctx context.Context, module string) (lease.Lease, error) {
 	l, fresh, err := c.lease(ctx)
 	if err != nil {
@@ -360,8 +384,13 @@ func (c *Client) Require(ctx context.Context, module string) (lease.Lease, error
 			return lease.Lease{}, err
 		}
 	}
+	if !l.Has(module) && floating(l, module) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.checkout(ctx, module)
+	}
 	if !l.Has(module) {
-		return l, &ModuleError{Product: c.cfg.Product, Module: module, Email: l.Email}
+		return l, &ModuleError{Product: c.cfg.Product, Module: module, Email: l.Email, Elsewhere: slices.Contains(l.Elsewhere, module)}
 	}
 	return l, nil
 }
@@ -558,7 +587,13 @@ func (c *Client) renewWithKey(ctx context.Context, token string, key *lease.Priv
 func (c *Client) SignIn(ctx context.Context) (lease.Lease, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	l, err := c.signInFlow(ctx, true)
+	var l lease.Lease
+	var err error
+	if t := c.token(); t != "" {
+		l, err = c.enrol(ctx, t)
+	} else {
+		l, err = c.signInFlow(ctx, true)
+	}
 	if err == nil {
 		c.checked = &l
 	}
@@ -686,3 +721,7 @@ func (c *Client) signInFlow(ctx context.Context, explicit bool) (lease.Lease, er
 		// Network errors: tried again until the sign-in expires.
 	}
 }
+
+// Dir returns the folder where the lease and the installation key are
+// kept.
+func (c *Client) Dir() string { return c.cfg.Dir }
