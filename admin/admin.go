@@ -324,6 +324,21 @@ type Allowed struct {
 	Created time.Time `json:"created"`
 }
 
+// Join is someone's request to create products, made on /join with
+// their address confirmed by email.
+type Join struct {
+	Email   string    `json:"email"`
+	Name    string    `json:"name"`
+	About   string    `json:"about"`
+	Website string    `json:"website"`
+	Created time.Time `json:"created"`
+	// Status is "pending", "approved" or "declined".
+	Status     string    `json:"status"`
+	Answer     string    `json:"answer"`
+	AnsweredBy string    `json:"answered_by"`
+	Answered   time.Time `json:"answered"`
+}
+
 func (c *Client) do(ctx context.Context, method, path string, in, out any) error {
 	server := strings.TrimRight(c.Server, "/")
 	if server == "" {
@@ -576,6 +591,26 @@ func (c *Client) Allow(ctx context.Context, email string) error {
 
 func (c *Client) Disallow(ctx context.Context, email string) error {
 	return c.do(ctx, "DELETE", p("allowed", email), nil, nil)
+}
+
+// Joins returns the requests to create products, newest first: those of
+// the status given, or all with status "". For operators.
+func (c *Client) Joins(ctx context.Context, status string) ([]Join, error) {
+	var js []Join
+	return js, c.do(ctx, "GET", "joins?status="+url.QueryEscape(status), nil, &js)
+}
+
+// ApproveJoin lets the address create products and tells them, with the
+// note if any.
+func (c *Client) ApproveJoin(ctx context.Context, email, note string) (Join, error) {
+	var j Join
+	return j, c.do(ctx, "POST", p("joins", email, "approve"), Answer{Note: note}, &j)
+}
+
+// DeclineJoin declines the request and tells them, with the note if any.
+func (c *Client) DeclineJoin(ctx context.Context, email, note string) (Join, error) {
+	var j Join
+	return j, c.do(ctx, "POST", p("joins", email, "decline"), Answer{Note: note}, &j)
 }
 
 // Customers returns the product's customers, with their members and live

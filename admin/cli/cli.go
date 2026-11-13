@@ -87,6 +87,9 @@ Customers, service accounts and floating copies:
 
 Operators:
   allowed | allow EMAIL | disallow EMAIL   who may create products
+  joins [-all]                        requests to create products, from /join
+  join-approve EMAIL [-note TEXT]     let them create products, and tell them
+  join-decline EMAIL [-note TEXT]     decline, and tell them
 
 The server is $LICENSEBOX_SERVER, or https://licensebox.dev. The session
 is kept in licensebox/admin-token in your configuration folder, or given
@@ -414,6 +417,41 @@ func Run(ctx context.Context, args []string, env Env) error {
 				fmt.Fprintf(r.tw, "%s\t%s\n", a.Email, date(a.Created))
 			}
 		})
+	case "joins":
+		fs := flags("joins")
+		all := fs.Bool("all", false, "answered ones too")
+		if _, err := parse(fs, rest, 0, "joins [-all]"); err != nil {
+			return err
+		}
+		status := "pending"
+		if *all {
+			status = ""
+		}
+		js, err := c.Joins(ctx, status)
+		return r.show(js, err, func() {
+			if len(js) == 0 {
+				fmt.Fprintln(r.tw, "No requests waiting.")
+				return
+			}
+			fmt.Fprintln(r.tw, "EMAIL\tNAME\tASKED\tSTATUS\tWEBSITE\tABOUT")
+			for _, j := range js {
+				fmt.Fprintf(r.tw, "%s\t%s\t%s\t%s\t%s\t%s\n", j.Email, j.Name, date(j.Created), j.Status, j.Website, oneLine(j.About))
+			}
+		})
+	case "join-approve", "join-decline":
+		fs := flags(cmd)
+		note := fs.String("note", "", "a note sent to them")
+		pos, err := parse(fs, rest, 1, cmd+" EMAIL [-note TEXT]")
+		if err != nil {
+			return err
+		}
+		var j admin.Join
+		if cmd == "join-approve" {
+			j, err = c.ApproveJoin(ctx, pos[0], *note)
+		} else {
+			j, err = c.DeclineJoin(ctx, pos[0], *note)
+		}
+		return r.show(j, err, func() { fmt.Fprintf(r.tw, "%s: %s, and told.\n", j.Email, j.Status) })
 	case "allow", "disallow":
 		pos, err := parse(flags(cmd), rest, 1, cmd+" EMAIL")
 		if err != nil {
